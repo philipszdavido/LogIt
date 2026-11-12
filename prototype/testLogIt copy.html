@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+<title>DOM DVR Replay</title>
+
+<head>
+
+    <style type="text/css">
+        body {
+            font: larger;
+            width: inherit;
+        }
+
+        #market {
+            width: 50px;
+            height: 100px;
+            background-color: green;
+            margin: 8px;
+        }
+
+        #marketPlate {
+            display: flex;
+            justify-content: space-between;
+        }
+    </style>
+    <script src="./LogIt.js"></script>
+    <script>
+        initLogIt("myAppId_122334545")
+        try {
+            var channel = new MessageChannel()
+            var port1 = channel.port1
+        } catch(e) {
+        }
+
+        function sendMsg() {
+            iframe.contentWindow.postMessage(input.value, channel.port2)
+        }
+
+        function recreate() {
+
+            var ifr = document.createElement("iframe")
+            ifr.src = "about:blank"
+            ifr.setAttribute("sandbox", "allow-same-origin")
+            ifr.addEventListener("load", (e) => {
+            })
+            window.container.appendChild(ifr)
+            // var ifrDoc = ifr.contentWindow.document
+            var ifrCntDoc = ifr.contentDocument
+            var ifrDoc = ifrCntDoc.documentElement
+
+            var htmlEl = ifrDoc.getElementsByTagName("html")[0]
+            var headEl = ifrDoc.getElementsByTagName("head")[0]
+            
+            var textN = ifrCntDoc.createTextNode("h3 Element")
+            var divN = ifrCntDoc.createElement("h3")
+            divN.appendChild(textN)
+            ifrCntDoc.body.appendChild(divN)
+            return
+
+            var lastEl
+
+            for (let index = 0; index < logs.length; index++) {
+                const log = logs[index];
+                if(log.type == "childList") {
+                    const { addedNodes, target } = log
+
+                    switch(target.tagName) {
+                        case "HEAD":
+                            log.addedNodes.forEach(n => {
+                                headEl.appendChild(document.importNode(n))
+                            })
+                            lastEl = headEl
+                            break;
+
+                        case "BODY":
+                            log.addedNodes.forEach(n => {
+                                bodyEl.appendChild(document.importNode(n))
+                            })
+                            lastEl = bodyEl
+                            break;
+
+                        case "HTML":
+                            log.addedNodes.forEach(n => {
+                                htmlEl.appendChild(document.importNode(n))
+                            })
+                            lastEl = htmlEl
+                            break;
+
+                        default:
+                            log.addedNodes.forEach(n => {
+                                lastEl.appendChild(document.importNode(n))
+                            })
+                            lastEl = log.target.cloneNode()
+                            break;
+                    }
+                }
+            }
+        }
+
+        function isNodeText(node) {
+            if(node) {
+                if(node.nodeName == "#text" && !node.tagName) {
+                    return true
+                }
+            }
+            return false
+        }
+    </script>
+
+</head>
+
+<body>
+    <div id="container">
+
+        <video id="video"></video>
+        <button onclick="f()">Start</button>
+        <button onclick="recorder.stop()">Stop</button>
+        <button onclick="recreate()">Recreate</button>
+    </div>
+
+    <script type="text/javascript">
+        const l = console.log
+        const allCards = {
+            CRS: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14],
+            STR: [1, 2, 3, 4, 5, 6, 7]
+        }
+
+        const me = []
+        const computer = []
+        var whotCards = []
+        const market = []
+        const playedCards = []
+        const wCards = [window.whotCard1, window.whotCard2, window.whotCard3, window.whotCard4, window.whotCard5]
+        var cardStartIndex = 0
+        var cardEndIndex = 3
+
+    </script>
+
+</body>
+
+</html>

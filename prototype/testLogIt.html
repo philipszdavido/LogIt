@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html>
+<title>DOM DVR Replay</title>
+
+<head>
+
+    <style type="text/css">
+        body {
+            font: larger;
+            width: inherit;
+        }
+
+        #market {
+            width: 50px;
+            height: 100px;
+            background-color: green;
+            margin: 8px;
+        }
+
+        #marketPlate {
+            display: flex;
+            justify-content: space-between;
+        }
+    </style>
+    <script src="./LogIt.js"></script>
+    <script>
+        initLogIt("myAppId_122334545")
+
+        var elCache = new Map()
+        const LOGIT_ID = "LogItId"
+
+        function recreate() {
+            const log = console.log
+            mutationObserver.disconnect()
+
+            var ifr = document.createElement("iframe")
+            ifr.src = "about:blank"
+            ifr.setAttribute("sandbox", "allow-same-origin")
+            ifr.addEventListener("load", (e) => {
+            })
+            window.container.appendChild(ifr)
+            // var ifrDoc = ifr.contentWindow.document
+            var ifrCntDoc = ifr.contentDocument
+            var ifrDoc = ifrCntDoc.documentElement
+
+            // var htmlEl = ifrDoc.getElementsByTagName("html")[0]
+            var htmlEl = ifr.contentDocument.documentElement.firstChild
+            var headEl = ifrDoc.getElementsByTagName("head")[0]
+            var bodyEl = ifrCntDoc.body
+
+            /*
+            var textN = ifrCntDoc.createTextNode("h3 Element")
+            var divN = ifrCntDoc.createElement("h3")
+            divN.appendChild(textN)
+            ifrCntDoc.body.appendChild(divN)
+            */
+
+            var lastEl
+
+            for (let index = 0; index < logs.length; index++) {
+                const log = logs[index];
+                if(log.type == "childList") {
+                    const { addedNodes, target } = log
+
+                    switch(target.tagName) {
+                        case "HEAD":
+                            log.addedNodes.forEach(n => {
+                                n = document.importNode(n)
+                                if(isNodeText(n)) {
+                                    //console.log(n)
+
+                                    headEl.appendChild(document.createTextNode(n.data))
+                                } else {
+                                    headEl.appendChild(document.importNode(n))
+                                }
+                            })
+                            lastEl = headEl
+                            break;
+
+                        case "BODY":
+                            log.addedNodes.forEach(n => {
+                                // n = document.importNode(n)
+                                if(isNodeText(n)) {
+                                    //console.log(n)
+                                    bodyEl.appendChild(document.createTextNode(n.data))
+                                } else if(!IsComment(n)){
+                                    //console.log(index)
+                                    var scriptNode = n
+                                    var logItAttr = n.getAttribute(LOGIT_ID)
+                                    var cNode
+
+                                    if(!logItAttr) {
+                                        logItAttr = genID()
+                                        scriptNode.setAttribute(LOGIT_ID, logItAttr)
+
+                                        scriptNode = scriptNode.cloneNode()
+                                        scriptNode.setAttribute("processsed", true)
+                                        elCache.set(logItAttr, scriptNode)
+                                        cNode = scriptNode
+                                    } else {
+                                        cNode = elCache.get(logItAttr)
+                                    }
+
+                                    bodyEl.appendChild(cNode)
+                                }
+                            })
+                            lastEl = bodyEl
+                            break;
+
+                        case "HTML":
+                            //console.log(htmlEl)
+                            log.addedNodes.forEach(n => {
+                                n = document.importNode(n)
+                                if(isNodeText(n)) {
+                                    htmlEl.textContent = n
+                                } else {
+                                    htmlEl.appendChild(n)
+                                }
+                            })
+                            lastEl = htmlEl
+                            break;
+
+                        case "SCRIPT":
+                            var cNode = log.target.cloneNode()
+                            /*var cNode = elCache.get(scriptNode)
+                            if(!cNode) {
+                                elCache.set(scriptNode, scriptNode.cloneNode())
+                                cNode = scriptNode
+                            }*/
+                            log.addedNodes.forEach(n => {
+                                n = document.importNode(n)
+                                if(isNodeText(n)) {
+                                    //console.log(n)
+                                    cNode.appendChild(document.createTextNode(n.data))
+                                } else {
+                                    cNode.appendChild(document.importNode(n))
+                                }
+                            })
+                            lastEl.appendChild(cNode)
+                            lastEl = log.target.cloneNode()
+                            break; 
+
+                        default:
+                            console.log("----------")
+                            var scriptNode = log.target
+                            var logItAttr = log.target.getAttribute(LOGIT_ID)
+                            var cNode
+                            console.log("logItAttr:", logItAttr)
+
+                            if(!logItAttr) {
+                                logItAttr = genID()
+                                scriptNode.setAttribute(LOGIT_ID, logItAttr)
+
+                                scriptNode = scriptNode.cloneNode()
+                                scriptNode.removeAttribute(LOGIT_ID)
+                                scriptNode.setAttribute("processed", true)
+                                elCache.set(logItAttr, scriptNode)
+                                cNode = scriptNode
+                            } else {
+                                cNode = elCache.get(logItAttr)
+                            }
+                            console.log(cNode)
+                            console.log(logItAttr)
+                            console.log(elCache)
+
+                            log.addedNodes.forEach(n => {
+                                n = document.importNode(n)
+                                if(isNodeText(n)) {
+                                     console.log("n:",n.data)
+                                     console.log("last element:",lastEl)
+                                     console.log("cNode:", cNode)
+                                    cNode.appendChild(n) // (document.createTextNode(n.data + "partey"))
+                                } else {
+                                    cNode.appendChild(n)
+                                }
+                            })
+                            // if(elCache.get())
+                            // lastEl.appendChild(cNode)
+                            console.log("-----*-----")
+                            lastEl = log.target.cloneNode()
+                            break;
+                    }
+                }
+            }
+        }
+
+        function isNodeText(node) {
+            if(node) {
+                if(node.nodeName == "#text" && !node.tagName) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        function IsComment(node) {
+            if(node) {
+                if(node.nodeName == "#comment" && !node.tagName) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        function genID() {
+            return Date.now().toString()
+        }
+    </script>
+
+</head>
+
+<body>
+    <div id="container">
+
+        <video id="video"></video>
+        <button onclick="f()">Start</button>
+        <button onclick="recorder.stop()">Stop</button>
+        <button onclick="recreate()">Recreate</button>
+    </div>
+
+    <script type="text/javascript">
+        const l = console.log
+        const allCards = {
+            CRS: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14],
+            STR: [1, 2, 3, 4, 5, 6, 7]
+        }
+
+        const me = []
+        const computer = []
+        var whotCards = []
+        const market = []
+        const playedCards = []
+        const wCards = [window.whotCard1, window.whotCard2, window.whotCard3, window.whotCard4, window.whotCard5]
+        var cardStartIndex = 0
+        var cardEndIndex = 3
+
+    </script>
+
+</body>
+
+</html>

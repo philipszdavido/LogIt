@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LogIt Demo Shop</title>
+  <!-- One-line install: records into app "demo" and sends to this server's /api/ingest -->
+  <script src="/sdk/logit.js" data-app-id="demo"></script>
+  <style>
+    body { font: 15px/1.5 system-ui, sans-serif; margin: 0; background: #fafafa; color: #222; }
+    header { background: #4f46e5; color: #fff; padding: 14px 24px; display: flex; justify-content: space-between; align-items: center; }
+    header a { color: #fff; }
+    main { max-width: 900px; margin: 24px auto; padding: 0 16px; display: grid; gap: 16px; grid-template-columns: 1fr 1fr; }
+    section { background: #fff; border: 1px solid #e5e5e5; border-radius: 10px; padding: 16px; }
+    h2 { margin-top: 0; font-size: 17px; }
+    button { background: #4f46e5; color: #fff; border: 0; border-radius: 6px; padding: 7px 12px; cursor: pointer; margin: 2px; }
+    button.secondary { background: #eef2ff; color: #4f46e5; }
+    input, select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; width: 100%; box-sizing: border-box; margin-bottom: 8px; }
+    ul { padding-left: 18px; }
+    li button { padding: 1px 6px; font-size: 12px; }
+    .done { text-decoration: line-through; color: #888; }
+    .card { padding: 10px; border-radius: 6px; background: #fff7ed; border: 1px dashed #fb923c; }
+    #status { font-family: monospace; font-size: 13px; white-space: pre-wrap; }
+    @media (max-width: 700px) { main { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>LogIt Demo Shop</strong>
+    <a id="session-link" href="#" target="_blank" rel="noopener">View this session ↗</a>
+  </header>
+
+  <main>
+    <section>
+      <h2>Todo list (DOM mutations)</h2>
+      <form id="todo-form">
+        <input id="todo-input" name="todo" placeholder="What needs doing?" autocomplete="off">
+        <button type="submit">Add</button>
+      </form>
+      <ul id="todo-list"></ul>
+    </section>
+
+    <section>
+      <h2>Sign in (input masking)</h2>
+      <form id="login-form">
+        <input id="email" name="email" type="email" placeholder="Email">
+        <input id="password" name="password" type="password" placeholder="Password (always masked)">
+        <label><input id="remember" type="checkbox"> Remember me</label><br>
+        <button type="submit">Sign in</button>
+      </form>
+    </section>
+
+    <section>
+      <h2>Network</h2>
+      <button id="fetch-ok">fetch OK</button>
+      <button id="fetch-slow">Slow fetch (1.5s)</button>
+      <button id="fetch-404">fetch 404</button>
+      <button id="xhr-ok">XHR request</button>
+      <div id="status"></div>
+    </section>
+
+    <section>
+      <h2>Errors &amp; logs</h2>
+      <button id="log-info" class="secondary">console.log</button>
+      <button id="log-error" class="secondary">console.error</button>
+      <button id="throw">Throw error</button>
+      <button id="reject">Unhandled rejection</button>
+      <button id="track" class="secondary">LogIt.track</button>
+    </section>
+
+    <section>
+      <h2>Privacy</h2>
+      <p>Masked text: <span data-logit-mask>4111 1111 1111 1111</span></p>
+      <div class="card" data-logit-block>This blocked widget never leaves the browser.</div>
+    </section>
+
+    <section>
+      <h2>SPA navigation</h2>
+      <button id="nav-a" class="secondary">Go to /demo/#products</button>
+      <button id="nav-b" class="secondary">pushState /demo/?page=cart</button>
+      <p id="route"></p>
+    </section>
+  </main>
+
+  <script>
+    const $ = id => document.getElementById(id)
+    const sessionUrl = window.LogIt && LogIt.getSessionURL()
+    if (sessionUrl) $('session-link').href = sessionUrl
+
+    $('todo-form').addEventListener('submit', e => {
+      e.preventDefault()
+      const text = $('todo-input').value.trim()
+      if (!text) return
+      const li = document.createElement('li')
+      const span = document.createElement('span')
+      span.textContent = text + ' '
+      span.addEventListener('click', () => span.classList.toggle('done'))
+      const del = document.createElement('button')
+      del.textContent = '✕'
+      del.addEventListener('click', () => li.remove())
+      li.append(span, del)
+      $('todo-list').appendChild(li)
+      $('todo-input').value = ''
+    })
+
+    $('login-form').addEventListener('submit', e => {
+      e.preventDefault()
+      const email = $('email').value
+      LogIt.identify(email || 'demo-user', { plan: 'pro', remember: $('remember').checked })
+      fetch('/demo/api/slow?ms=200', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer demo-secret' }, body: JSON.stringify({ email }) })
+    })
+
+    const show = text => { $('status').textContent = text }
+    $('fetch-ok').onclick = () => fetch('/healthz').then(r => r.json()).then(j => show(JSON.stringify(j)))
+    $('fetch-slow').onclick = () => fetch('/demo/api/slow?ms=1500').then(r => r.json()).then(j => show(JSON.stringify(j)))
+    $('fetch-404').onclick = () => fetch('/demo/missing.json').then(r => show('status ' + r.status))
+    $('xhr-ok').onclick = () => {
+      const xhr = new XMLHttpRequest()
+      xhr.open('GET', '/healthz')
+      xhr.onload = () => show('XHR ' + xhr.status + ' ' + xhr.responseText)
+      xhr.send()
+    }
+
+    $('log-info').onclick = () => console.log('Cart contents', { items: [{ sku: 'A1', qty: 2 }], total: 39.98 })
+    $('log-error').onclick = () => console.error('Payment provider returned an error', { code: 'card_declined' })
+    $('throw').onclick = () => { setTimeout(() => { throw new TypeError('Cannot read properties of undefined (reading \'price\')') }) }
+    $('reject').onclick = () => { Promise.reject(new Error('Checkout request timed out')) }
+    $('track').onclick = () => LogIt.track('Checkout Started', { items: 2, total: 39.98 })
+
+    const renderRoute = () => { $('route').textContent = 'Current URL: ' + location.pathname + location.search + location.hash }
+    $('nav-a').onclick = () => { location.hash = 'products' }
+    $('nav-b').onclick = () => { history.pushState({}, '', '/demo/?page=cart'); renderRoute() }
+    window.addEventListener('hashchange', renderRoute)
+    renderRoute()
+  </script>
+</body>
+</html>

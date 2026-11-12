@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LogIt Sessions</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/">LogIt</a>
+    <label class="field">
+      <span>App</span>
+      <select id="app-select"></select>
+    </label>
+    <input id="search" type="search" placeholder="Search user, URL or session id" autocomplete="off">
+    <label class="check"><input id="errors-only" type="checkbox"> With errors</label>
+    <button id="refresh" type="button">Refresh</button>
+    <button id="token-btn" type="button" class="ghost">API token</button>
+  </header>
+
+  <main class="layout">
+    <aside class="sessions">
+      <div id="session-count" class="muted"></div>
+      <ul id="session-list"></ul>
+      <button id="load-more" type="button" class="ghost" hidden>Load more</button>
+    </aside>
+
+    <section class="player-col">
+      <div id="empty" class="empty">Select a session to replay it.</div>
+      <div id="player" hidden>
+        <div class="session-head">
+          <div>
+            <div id="session-title" class="title"></div>
+            <div id="session-sub" class="muted"></div>
+          </div>
+          <div class="actions">
+            <button id="copy-link" type="button" class="ghost">Copy link</button>
+            <button id="delete-session" type="button" class="danger">Delete</button>
+          </div>
+        </div>
+        <div id="stage" class="stage"></div>
+        <div class="controls">
+          <button id="play" type="button" class="play" aria-label="Play">▶</button>
+          <span id="time" class="time">0:00 / 0:00</span>
+          <div id="timeline" class="timeline" role="slider" aria-label="Seek" tabindex="0">
+            <div id="progress" class="progress"></div>
+            <div id="markers"></div>
+          </div>
+          <select id="speed" aria-label="Playback speed">
+            <option value="1">1×</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+            <option value="8">8×</option>
+          </select>
+          <label class="check"><input id="skip" type="checkbox" checked> Skip idle</label>
+        </div>
+      </div>
+    </section>
+
+    <section class="devtools" id="devtools" hidden>
+      <nav class="tabs" id="tabs"></nav>
+      <div id="panel" class="panel"></div>
+    </section>
+  </main>
+
+  <dialog id="token-dialog">
+    <form method="dialog">
+      <h3>API token</h3>
+      <p class="muted">Enter the server's <code>LOGIT_ADMIN_TOKEN</code>. It is stored in this browser only.</p>
+      <input id="token-input" type="password" autocomplete="off">
+      <div class="actions">
+        <button value="cancel" class="ghost">Cancel</button>
+        <button value="save" id="token-save">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="/sdk/replayer.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

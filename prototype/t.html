@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html>
+<title>Naija Whot</title>
+
+<head>
+
+    <style type="text/css">
+        body {
+            font: larger;
+            width: inherit;
+        }
+
+        #container {
+            margin-left: 35%;
+            margin-right: 35%;
+        }
+
+        #whotCard {
+            width: 50px;
+            height: 100px;
+            background-color: greenyellow;
+            padding-bottom: 2px;
+            margin-bottom: 5px;
+            padding: 8px;
+            margin: 8px;
+            text-align: center;
+            font-size: 40px;
+            font-family: "Brazil";
+            box-shadow: 34px;
+            border-radius: 8px;
+        }
+
+        .whotCard {
+            width: 50px;
+            height: 100px;
+            background-color: greenyellow;
+            padding-bottom: 2px;
+            margin-bottom: 5px;
+            padding: 8px;
+            margin: 8px;
+            text-align: center;
+            font-size: 40px;
+            font-family: "Brazil";
+            box-shadow: 34px;
+            border-radius: 8px;
+        }
+
+        #meSection {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        #computerSection {
+            display: flex;
+            justify-content: space-between;
+        }
+
+        #played {
+            width: 50px;
+            height: 100px;
+            background-color: brown;
+            margin: 8px;
+        }
+
+        #market {
+            width: 50px;
+            height: 100px;
+            background-color: green;
+            margin: 8px;
+        }
+
+        #marketPlate {
+            display: flex;
+            justify-content: space-between;
+        }
+    </style>
+    <script src="./LogIt.js"></script>
+    <script>
+        initLogIt("myAppId_122334545")
+
+        var recorder
+        var chunks
+        function f() {
+            navigator.mediaDevices.getDisplayMedia({
+                video: {
+                    mediaSource: "screen"
+                }
+            }).then((stream) => {
+                recorder = new MediaRecorder(stream);
+                chunks = [];
+                recorder.ondataavailable = e => chunks.push(e.data);
+                recorder.start();
+
+                recorder.onstop = e => {
+                    const completeBlob = new Blob(chunks, { type: chunks[0].type });
+                    video.src = URL.createObjectURL(completeBlob);
+                };
+            })
+        }
+
+        function recreate() {
+            var ifr = document.createElement("iframe")
+            window.container.appendChild(ifr)
+            var ifrDoc = ifr.contentDocument
+            ifrDoc.appendChild()
+
+            for (let index = 0; index < logs.length; index++) {
+                const log = logs[index];
+                if(log.type == "childList") {
+
+                }
+            }
+
+            ifr.contentDocument.appendChild()
+        }
+    </script>
+
+</head>
+
+<body>
+    <div id="container">
+
+        <video id="video"></video>
+        <button onclick="f()">Start</button>
+        <button onclick="recorder.stop()">Stop</button>
+        <button onclick="recreate()">Recreate</button>
+        <div id="meSection">
+            <div id="whotCard1" class="whotCard"></div>
+            <div id="whotCard2" class="whotCard"></div>
+            <div id="whotCard3" class="whotCard"></div>
+            <div id="whotCard4" class="whotCard"></div>
+            <div id="whotCard5" class="whotCard"></div>
+            <div id="moreCards" style="height: 50px; width: 50px; border-radius: 50%;border: 2px solid;">Cy</div>
+        </div>
+        <div id="marketPlate">
+            <div id="market"></div>
+            <div id="played"></div>
+        </div>
+        <div id="computerSection">
+            <div id="whotCard"></div>
+            <div id="whotCard"></div>
+            <div id="whotCard"></div>
+            <div id="whotCard"></div>
+            <div id="whotCard"></div>
+        </div>
+    </div>
+
+    <script type="text/javascript">
+        const l = console.log
+        const allCards = {
+            TRI: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14],
+            CIR: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14],
+            SQR: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14],
+            CRS: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14],
+            STR: [1, 2, 3, 4, 5, 6, 7]
+        }
+
+        const me = []
+        const computer = []
+        var whotCards = []
+        const market = []
+        const playedCards = []
+        const wCards = [window.whotCard1, window.whotCard2, window.whotCard3, window.whotCard4, window.whotCard5]
+        var cardStartIndex = 0
+        var cardEndIndex = 3
+
+        function genCards() {
+            const cards = []
+            const keys = Object.keys(allCards)
+            for (var key of keys) {
+                allCards[key].forEach(c => cards.push({
+                    type: key,
+                    value: c
+                }))
+            }
+            return cards
+        }
+
+        function shuffle(cards) {
+            // TODO: Implement this
+            for (var index = 0; index < cards.length; index++) {
+                var card = cards[index];
+                Math.random() * cards.length
+            }
+        }
+
+        function shareCards(cards, numEach) {
+            let i = 0
+            for (var index = 0; index < numEach; index++) {
+                me.push(cards[i]), i++;
+                computer.push(cards[i]), i++
+            }
+            cards.splice(0, numEach * 2)
+        }
+
+        whotCards = genCards()
+        shareCards(whotCards, 5)
+        playedCards.push(whotCards[0]), whotCards.splice(0, 0);
+
+
+        function playCard(card) {
+            playedCards.push(card)
+        }
+
+        function shouldPlayCard(card) {
+            const recCard = playedCards[playedCards.length - 1]
+            l(recCard)
+            if (recCard.type === card.type || recCard.value === card.value) {
+                return true
+            }
+            return false
+        }
+
+        // l(me, computer, whotCards)
+
+        function render() {
+            const recCard = playedCards[playedCards.length - 1]
+            played.innerHTML = recCard.type + " " + recCard.value
+        }
+
+        function renderMyCards() {
+            wCards.forEach((_whotCard, index) => {
+                _whotCard["card"] = me[index]
+                _whotCard.innerHTML = me[index].type + " " + me[index].value
+            })
+        }
+
+        wCards.forEach((_whotCard, index) => {
+            _whotCard["card"] = me[index]
+            _whotCard.innerHTML = me[index].type + " " + me[index].value
+            _whotCard.addEventListener("click", () => {
+                const card = _whotCard["card"]
+                l(card)
+                if (shouldPlayCard(card)) {
+                    playCard(card)
+                    render()
+                }
+            })
+        })
+
+        moreCards.addEventListener("click", (e) => {
+
+        })
+
+            l(me, computer, whotCards)
+
+    </script>
+
+</body>
+
+</html>

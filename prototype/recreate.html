@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html>
+<title></title>
+
+<head>
+    <style></style>
+
+</head>
+
+<body>
+    <button>Button</button>
+</body>
+    <script>
+        var port2
+        const l = console.log
+        window.addEventListener("message", function (e) {
+            l(e)
+            port2 = e.ports[0]
+            port2.onmessage = onMessage
+        })
+
+        function onMessage(e) {
+            l(e)
+        }
+    </script>
+
+</html>
