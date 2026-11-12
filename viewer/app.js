@@ -231,9 +231,12 @@
       `${meta.eventCount} events`
     ].join(' · ')
 
+    // Archived copies of the page's images, fonts and stylesheets, keyed by original URL.
+    const assets = data.assets || {}
     const replayer = new LogItReplayer($('stage'), data.events, {
       speed: Number($('speed').value),
-      skipInactive: $('skip').checked
+      skipInactive: $('skip').checked,
+      resolveUrl: url => (Object.prototype.hasOwnProperty.call(assets, url) ? '/assets/' + assets[url] : null)
     })
     state.replayer = replayer
     replayer.on('time', onTime)

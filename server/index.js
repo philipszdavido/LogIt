@@ -4,7 +4,8 @@ const http = require('http')
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
-const { SessionStore, ID_RE } = require('./store')
+const { createStore, ID_RE, ASSET_ID_RE } = require('./store')
+const { AssetArchiver } = require('./assets')
 
 const ROOT = path.resolve(__dirname, '..')
 const MAX_EVENTS_PER_BATCH = 5000
@@ -18,6 +19,9 @@ const CONTENT_TYPES = {
   '.png': 'image/png',
   '.ico': 'image/x-icon'
 }
+
+// Archived assets are attacker-influenced content (e.g. SVG): never let them run script on our origin.
+const ASSET_CSP = "default-src 'none'; img-src data:; style-src 'unsafe-inline'; font-src data:; sandbox"
 
 // The replay iframe inherits this policy: recorded scripts are blocked, recorded styles/images/fonts load.
 const VIEWER_CSP = [
@@ -45,6 +49,12 @@ function configFromEnv(env = process.env) {
     port: Number(env.PORT || 4000),
     host: env.HOST || '0.0.0.0',
     dataDir: env.LOGIT_DATA_DIR || path.join(ROOT, 'data'),
+    databaseUrl: env.LOGIT_DATABASE_URL || '',
+    dbPoolSize: Number(env.LOGIT_DB_POOL_SIZE || 10),
+    archiveAssets: env.LOGIT_ARCHIVE_ASSETS ? env.LOGIT_ARCHIVE_ASSETS === 'true' : true,
+    assetAllowPrivate: env.LOGIT_ASSET_ALLOW_PRIVATE ? env.LOGIT_ASSET_ALLOW_PRIVATE === 'true' : !production,
+    assetMaxBytes: Number(env.LOGIT_ASSET_MAX_BYTES || 5 * 1024 * 1024),
+    assetHosts: list(env.LOGIT_ASSET_HOSTS),
     adminToken: env.LOGIT_ADMIN_TOKEN || '',
     allowedAppIds: list(env.LOGIT_ALLOWED_APP_IDS),
     allowedOrigins: list(env.LOGIT_ALLOWED_ORIGINS || '*'),
@@ -135,8 +145,16 @@ async function createApp(overrides = {}) {
   if (config.production && !config.adminToken) {
     throw new Error('LOGIT_ADMIN_TOKEN must be set when NODE_ENV=production')
   }
-  const store = new SessionStore(config.dataDir)
+  const store = createStore(config)
   await store.init()
+  const archiver = config.archiveAssets
+    ? new AssetArchiver(store, {
+      allowPrivate: config.assetAllowPrivate,
+      maxBytes: config.assetMaxBytes,
+      allowedHosts: config.assetHosts,
+      log: config.log
+    })
+    : null
   const limiter = createRateLimiter(config.rateLimitPerMinute)
   const tokenHash = config.adminToken ? hashToken(config.adminToken) : null
 
@@ -194,6 +212,13 @@ async function createApp(overrides = {}) {
     const problem = validateBatch(batch, config)
     if (problem) throw new HttpError(400, problem)
     await store.append(batch)
+    if (archiver) {
+      try {
+        archiver.enqueue(batch.appId, batch.sessionId, batch.events)
+      } catch (err) {
+        config.log('asset extraction failed', err.message)
+      }
+    }
     sendJson(res, 202, { ok: true })
   }
 
@@ -205,14 +230,14 @@ async function createApp(overrides = {}) {
     const parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent) // ['api', ...]
 
     if (parts[1] === 'apps' && parts.length === 2 && req.method === 'GET') {
-      return sendJson(res, 200, { apps: store.apps() })
+      return sendJson(res, 200, { apps: await store.apps() })
     }
 
     if (parts[1] === 'sessions' && parts.length === 2 && req.method === 'GET') {
       const p = url.searchParams
       const limit = Math.min(Math.max(parseInt(p.get('limit'), 10) || 50, 1), 500)
       const offset = Math.max(parseInt(p.get('offset'), 10) || 0, 0)
-      return sendJson(res, 200, store.list({
+      return sendJson(res, 200, await store.list({
         appId: p.get('appId') || undefined,
         q: p.get('q') || undefined,
         errorsOnly: p.get('errors') === '1',
@@ -225,10 +250,11 @@ async function createApp(overrides = {}) {
       const [, , appId, sessionId] = parts
       if (!ID_RE.test(appId) || !ID_RE.test(sessionId)) throw new HttpError(400, 'invalid id')
       if (req.method === 'GET') {
-        const meta = store.getMeta(appId, sessionId)
+        const meta = await store.getMeta(appId, sessionId)
         const events = meta && await store.getEvents(appId, sessionId)
         if (!events) throw new HttpError(404, 'Session not found')
-        return sendJson(res, 200, { meta, events })
+        const assets = await store.getSessionAssets(appId, sessionId)
+        return sendJson(res, 200, { meta, events, assets })
       }
       if (req.method === 'DELETE') {
         if (!(await store.delete(appId, sessionId))) throw new HttpError(404, 'Session not found')
@@ -239,6 +265,23 @@ async function createApp(overrides = {}) {
     }
 
     throw new HttpError(404, 'Not found')
+  }
+
+  // Content-addressed, so public and cacheable forever; hashes are not guessable without the content.
+  async function serveAsset(req, res, hash) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Method not allowed')
+    if (!ASSET_ID_RE.test(hash)) throw new HttpError(404, 'Not found')
+    const asset = await store.getAsset(hash)
+    if (!asset) throw new HttpError(404, 'Not found')
+    res.writeHead(200, {
+      'Content-Type': asset.contentType,
+      'Content-Length': asset.body.length,
+      'Cache-Control': 'public, max-age=31536000, immutable',
+      'Content-Security-Policy': ASSET_CSP,
+      'Access-Control-Allow-Origin': '*',
+      'Cross-Origin-Resource-Policy': 'cross-origin'
+    })
+    res.end(req.method === 'HEAD' ? undefined : asset.body)
   }
 
   function serveStatic(req, res, url) {
@@ -288,7 +331,14 @@ async function createApp(overrides = {}) {
       url = new URL(req.url, 'http://localhost')
       if (url.pathname === '/api/ingest') await handleIngest(req, res)
       else if (url.pathname.startsWith('/api/')) await handleApi(req, res, url)
-      else if (url.pathname === '/healthz') sendJson(res, 200, { ok: true, sessions: store.index.size })
+      else if (url.pathname.startsWith('/assets/')) await serveAsset(req, res, url.pathname.slice('/assets/'.length))
+      else if (url.pathname === '/healthz') {
+        try {
+          sendJson(res, 200, { ok: true, sessions: await store.count() })
+        } catch (err) {
+          sendJson(res, 503, { ok: false, error: 'storage unavailable' })
+        }
+      }
       else if (url.pathname === '/' || url.pathname === '/viewer') {
         res.writeHead(302, { Location: '/viewer/' })
         res.end()
@@ -316,7 +366,10 @@ async function createApp(overrides = {}) {
   const retentionMs = config.retentionDays * 24 * 60 * 60 * 1000
   const pruneTimer = config.retentionDays > 0
     ? setInterval(() => {
-      store.prune(retentionMs).then(n => n && config.log(`retention: removed ${n} session(s)`))
+      store.prune(retentionMs)
+        .then(n => { if (n) config.log(`retention: removed ${n} session(s)`) })
+        .then(() => store.gcAssets(60 * 60 * 1000))
+        .then(n => { if (n) config.log(`retention: removed ${n} unreferenced asset(s)`) })
         .catch(err => config.log('retention error', err))
     }, 60 * 60 * 1000)
     : null
@@ -333,14 +386,18 @@ async function createApp(overrides = {}) {
   return {
     server,
     store,
+    archiver,
     config,
     url: `http://${host}:${address.port}`,
     async close() {
       if (pruneTimer) clearInterval(pruneTimer)
       limiter.stop()
-      await new Promise(resolve => server.close(resolve))
-      server.closeAllConnections && server.closeAllConnections()
+      const closed = new Promise(resolve => server.close(resolve))
+      if (server.closeIdleConnections) server.closeIdleConnections()
+      await closed
+      if (archiver) await archiver.drain()
       await store.drain()
+      await store.close()
     }
   }
 }
@@ -348,7 +405,7 @@ async function createApp(overrides = {}) {
 if (require.main === module) {
   createApp().then(app => {
     const { config } = app
-    config.log(`LogIt server listening on ${app.url}`)
+    config.log(`LogIt server listening on ${app.url} (storage: ${config.databaseUrl ? 'postgres' : config.dataDir})`)
     config.log(`viewer: ${app.url}/viewer/   sdk: ${app.url}/sdk/logit.js${config.serveDemo ? `   demo: ${app.url}/demo/` : ''}`)
     if (!config.adminToken) config.log('WARNING: LOGIT_ADMIN_TOKEN is not set; the session API is unauthenticated')
     let closing = false

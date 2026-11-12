@@ -3,30 +3,28 @@
 const fs = require('fs')
 const fsp = fs.promises
 const path = require('path')
-
-const ID_RE = /^[A-Za-z0-9_-]{1,64}$/
-
-function clip(value, max) {
-  return typeof value === 'string' ? value.slice(0, max) : undefined
-}
+const { ID_RE, ASSET_ID_RE, newMeta, updateMeta, matchesQuery } = require('./meta')
 
 /**
- * File-backed session store.
+ * File-backed store for a single server instance (use the Postgres store to run several).
  *
  *   <dataDir>/<appId>/<sessionId>/events.ndjson  one line per ingested batch
  *   <dataDir>/<appId>/<sessionId>/meta.json      summary used by the session list
+ *   <dataDir>/<appId>/<sessionId>/assets.json    original URL -> archived asset hash
+ *   <dataDir>/.assets/<hh>/<hash>(.type)         archived assets, content-addressed
  *
  * Session summaries are kept in memory for listing; writes to one session are serialized.
  */
-class SessionStore {
+class FileStore {
   constructor(dataDir) {
     this.dataDir = path.resolve(dataDir)
+    this.assetDir = path.join(this.dataDir, '.assets') // '.' is not allowed in app ids, so no clash
     this.index = new Map()
     this.queues = new Map()
   }
 
   async init() {
-    await fsp.mkdir(this.dataDir, { recursive: true })
+    await fsp.mkdir(this.assetDir, { recursive: true })
     for (const appId of await safeReaddir(this.dataDir)) {
       if (!ID_RE.test(appId)) continue
       for (const sessionId of await safeReaddir(path.join(this.dataDir, appId))) {
@@ -41,6 +39,10 @@ class SessionStore {
     }
   }
 
+  async close() {
+    await this.drain()
+  }
+
   _dir(appId, sessionId) {
     if (!ID_RE.test(appId) || !ID_RE.test(sessionId)) throw new Error('invalid id')
     return path.join(this.dataDir, appId, sessionId)
@@ -48,6 +50,11 @@ class SessionStore {
 
   _metaPath(appId, sessionId) {
     return path.join(this._dir(appId, sessionId), 'meta.json')
+  }
+
+  _assetPath(hash) {
+    if (!ASSET_ID_RE.test(hash)) throw new Error('invalid asset id')
+    return path.join(this.assetDir, hash.slice(0, 2), hash)
   }
 
   _enqueue(k, fn) {
@@ -77,40 +84,38 @@ class SessionStore {
       const meta = this.index.get(k) || newMeta(appId, sessionId)
       updateMeta(meta, batch, Buffer.byteLength(line))
       this.index.set(k, meta)
-      const tmp = this._metaPath(appId, sessionId) + '.tmp'
-      await fsp.writeFile(tmp, JSON.stringify(meta))
-      await fsp.rename(tmp, this._metaPath(appId, sessionId))
+      await writeAtomic(this._metaPath(appId, sessionId), JSON.stringify(meta))
       return meta
     })
   }
 
-  apps() {
+  async count() {
+    return this.index.size
+  }
+
+  async apps() {
     const counts = new Map()
     for (const meta of this.index.values()) counts.set(meta.appId, (counts.get(meta.appId) || 0) + 1)
     return [...counts].map(([appId, sessions]) => ({ appId, sessions })).sort((a, b) => a.appId.localeCompare(b.appId))
   }
 
-  list({ appId, q, limit = 50, offset = 0, errorsOnly = false } = {}) {
+  async list({ appId, q, limit = 50, offset = 0, errorsOnly = false } = {}) {
     const needle = (q || '').toLowerCase()
-    let sessions = [...this.index.values()].filter(m => {
+    const sessions = [...this.index.values()].filter(m => {
       if (appId && m.appId !== appId) return false
       if (errorsOnly && !m.errorCount) return false
-      if (!needle) return true
-      const haystack = [m.sessionId, m.firstUrl, m.lastUrl, m.user && m.user.id, m.user && JSON.stringify(m.user.traits || {})]
-      return haystack.some(v => v && String(v).toLowerCase().includes(needle))
+      return !needle || matchesQuery(m, needle)
     })
     sessions.sort((a, b) => b.lastEventAt - a.lastEventAt)
-    const total = sessions.length
-    sessions = sessions.slice(offset, offset + limit)
-    return { total, sessions }
+    return { total: sessions.length, sessions: sessions.slice(offset, offset + limit) }
   }
 
-  getMeta(appId, sessionId) {
+  async getMeta(appId, sessionId) {
     return this.index.get(key(appId, sessionId)) || null
   }
 
   async getEvents(appId, sessionId) {
-    if (!this.getMeta(appId, sessionId)) return null
+    if (!this.index.has(key(appId, sessionId))) return null
     await (this.queues.get(key(appId, sessionId)) || Promise.resolve()).catch(() => {})
     let raw
     try {
@@ -156,6 +161,73 @@ class SessionStore {
   async drain() {
     await Promise.all([...this.queues.values()].map(p => p.catch(() => {})))
   }
+
+  // ---------------------------------------------------------------- assets
+
+  async hasAsset(hash) {
+    try {
+      await fsp.access(this._assetPath(hash))
+      return true
+    } catch (e) {
+      return false
+    }
+  }
+
+  async putAsset(hash, contentType, body) {
+    const file = this._assetPath(hash)
+    await fsp.mkdir(path.dirname(file), { recursive: true })
+    await writeAtomic(file + '.type', contentType)
+    await writeAtomic(file, body)
+  }
+
+  async getAsset(hash) {
+    const file = this._assetPath(hash)
+    try {
+      const [body, contentType] = await Promise.all([fsp.readFile(file), fsp.readFile(file + '.type', 'utf8')])
+      return { body, contentType }
+    } catch (e) {
+      if (e.code === 'ENOENT') return null
+      throw e
+    }
+  }
+
+  addSessionAssets(appId, sessionId, map) {
+    const k = key(appId, sessionId)
+    return this._enqueue(k, async () => {
+      if (!this.index.has(k)) return // deleted meanwhile
+      const file = path.join(this._dir(appId, sessionId), 'assets.json')
+      const current = await readJson(file, {})
+      await writeAtomic(file, JSON.stringify(Object.assign(current, map)))
+    })
+  }
+
+  async getSessionAssets(appId, sessionId) {
+    return readJson(path.join(this._dir(appId, sessionId), 'assets.json'), {})
+  }
+
+  // Removes archived assets no session references any more (older than graceMs, so in-flight archiving is safe).
+  async gcAssets(graceMs) {
+    const referenced = new Set()
+    for (const meta of this.index.values()) {
+      const map = await this.getSessionAssets(meta.appId, meta.sessionId)
+      for (const hash of Object.values(map)) referenced.add(hash)
+    }
+    const cutoff = Date.now() - graceMs
+    let removed = 0
+    for (const shard of await safeReaddir(this.assetDir)) {
+      for (const name of await safeReaddir(path.join(this.assetDir, shard))) {
+        if (!ASSET_ID_RE.test(name) || referenced.has(name)) continue
+        const file = path.join(this.assetDir, shard, name)
+        try {
+          if ((await fsp.stat(file)).mtimeMs > cutoff) continue
+          await fsp.rm(file, { force: true })
+          await fsp.rm(file + '.type', { force: true })
+          removed++
+        } catch (e) { /* raced with another delete */ }
+      }
+    }
+    return removed
+  }
 }
 
 function key(appId, sessionId) {
@@ -170,74 +242,26 @@ async function safeReaddir(dir) {
   }
 }
 
-function newMeta(appId, sessionId) {
-  return {
-    appId,
-    sessionId,
-    startedAt: Infinity,
-    lastEventAt: 0,
-    receivedAt: Date.now(),
-    eventCount: 0,
-    errorCount: 0,
-    failedRequests: 0,
-    slowRequests: 0,
-    pageCount: 0,
-    firstUrl: null,
-    lastUrl: null,
-    userAgent: null,
-    viewport: null,
-    user: null,
-    sizeBytes: 0
-  }
-}
-
-function updateMeta(meta, batch, bytes) {
-  meta.sizeBytes += bytes
-  meta.receivedAt = Date.now()
-  if (batch.user && typeof batch.user === 'object') meta.user = sanitizeUser(batch.user)
-  for (const ev of batch.events) {
-    meta.eventCount++
-    if (ev.t < meta.startedAt) meta.startedAt = ev.t
-    if (ev.t > meta.lastEventAt) meta.lastEventAt = ev.t
-    const d = ev.data && typeof ev.data === 'object' ? ev.data : {}
-    switch (ev.type) {
-      case 'meta':
-        meta.pageCount++
-        if (!meta.firstUrl) meta.firstUrl = clip(d.href, 2000)
-        meta.lastUrl = clip(d.href, 2000)
-        meta.userAgent = clip(d.userAgent, 500) || meta.userAgent
-        if (d.viewport) meta.viewport = { width: +d.viewport.width || 0, height: +d.viewport.height || 0 }
-        break
-      case 'nav':
-        meta.lastUrl = clip(d.href, 2000) || meta.lastUrl
-        break
-      case 'error':
-        meta.errorCount++
-        break
-      case 'console':
-        if (d.level === 'error') meta.errorCount++
-        break
-      case 'network':
-        if (!d.status || d.status >= 500) meta.failedRequests++
-        if (d.slow) meta.slowRequests++
-        break
-      case 'identify':
-        meta.user = sanitizeUser(d)
-        break
-    }
-  }
-  if (meta.startedAt === Infinity) meta.startedAt = meta.lastEventAt
-}
-
-function sanitizeUser(user) {
-  if (!user || user.id == null) return null
-  let traits
+async function readJson(file, fallback) {
   try {
-    traits = user.traits && typeof user.traits === 'object' ? JSON.parse(JSON.stringify(user.traits).slice(0, 2000)) : undefined
+    return JSON.parse(await fsp.readFile(file, 'utf8'))
   } catch (e) {
-    traits = undefined
+    return fallback
   }
-  return { id: String(user.id).slice(0, 200), traits }
 }
 
-module.exports = { SessionStore, ID_RE }
+async function writeAtomic(file, data) {
+  const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
+  await fsp.writeFile(tmp, data)
+  await fsp.rename(tmp, file)
+}
+
+function createStore(config) {
+  if (config.databaseUrl) {
+    const { PgStore } = require('./pg-store')
+    return new PgStore(config.databaseUrl, { poolSize: config.dbPoolSize })
+  }
+  return new FileStore(config.dataDir)
+}
+
+module.exports = { FileStore, SessionStore: FileStore, createStore, ID_RE, ASSET_ID_RE }

@@ -1,0 +1,30 @@
+# Postgres-backed deployment. Scale the app with `docker compose up --scale logit=3` behind your load balancer:
+# every instance shares sessions and archived assets through the database.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: logit
+      POSTGRES_PASSWORD: logit
+      POSTGRES_DB: logit
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logit"]
+      interval: 5s
+      retries: 10
+
+  logit:
+    build: .
+    environment:
+      LOGIT_DATABASE_URL: postgres://logit:logit@db:5432/logit
+      LOGIT_ADMIN_TOKEN: ${LOGIT_ADMIN_TOKEN:?set LOGIT_ADMIN_TOKEN}
+      LOGIT_TRUST_PROXY: "true"
+    ports:
+      - "4000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:

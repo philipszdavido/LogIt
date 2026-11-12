@@ -1,9 +1,10 @@
 /*!
  * LogIt recorder SDK
- * Records DOM snapshots + mutations, user interactions, console output, errors,
- * network requests and performance data, and ships them in batches to a LogIt server.
+ * Records DOM snapshots + mutations (including shadow DOM, same-origin iframes, canvas, media and
+ * constructable stylesheets), user interactions, console output, errors, network requests and
+ * performance data, and ships them in batches to a LogIt server.
  *
- * Install:
+ * Install (as early in <head> as possible):
  *   <script src="https://your-logit-host/sdk/logit.js" data-app-id="my-app"></script>
  * or
  *   LogIt.init({ appId: 'my-app', endpoint: 'https://your-logit-host/api/ingest' })
@@ -14,12 +15,14 @@
   if (window.LogIt && window.LogIt.__loaded) return
 
   var document = window.document
-  var VERSION = '1.0.0'
+  var VERSION = '1.1.0'
   var SVG_NS = 'http://www.w3.org/2000/svg'
   var STORAGE_KEY = 'logit_session'
   var ID_RE = /^[A-Za-z0-9_-]{1,64}$/
   var DROP_ATTR_RE = /^on/i
+  var STYLESHEET_RE = /(^|\s)stylesheet(\s|$)/i
   var URL_ATTRS = { href: 1, src: 1, action: 1, poster: 1, background: 1, 'xlink:href': 1, cite: 1, data: 1 }
+  var MEDIA_EVENTS = ['play', 'pause', 'seeked', 'ratechange', 'volumechange']
 
   var DEFAULTS = {
     appId: null,
@@ -37,6 +40,12 @@
     recordErrors: true,
     recordNetwork: true,
     recordPerformance: true,
+    recordIframes: true,        // contents of same-origin iframes
+    recordMedia: true,          // <video>/<audio> play, pause, seek, rate and volume
+    recordCanvas: false,        // <canvas> frames, and frames of <video> that cannot be replayed from a URL
+    canvasFps: 2,
+    canvasQuality: 0.6,
+    inlineStylesheets: true,    // embed readable <link rel=stylesheet> CSS so replays survive deploys
     consoleLevels: ['log', 'info', 'warn', 'error', 'debug'],
     maskAllInputs: false,
     maskInputTypes: ['password'],          // 'password' is always masked
@@ -72,13 +81,25 @@
   var nextNodeId = 1
   var observer = null
   var flushTimer = null
+  var canvasTimer = null
   var flushScheduled = false
   var inflight = null
   var failures = 0
   var backoffUntil = 0
   var needSnapshot = false
+  var lastFallbackSnapshot = 0
   var patched = {}
   var inConsoleHook = false
+
+  var closedRoots = new WeakMap()     // host -> closed ShadowRoot (only reachable through our attachShadow hook)
+  var listenedRoots = new WeakSet()   // documents / shadow roots that have our event listeners
+  var handledEvents = new WeakSet()   // composed events seen by more than one root listener
+  var sheetIds = new WeakMap()        // constructed CSSStyleSheet -> id
+  var nextSheetId = 1
+  var sheetsSent = new WeakSet()      // sheets whose CSS was already sent since the last full snapshot
+  var canvases = new Set()
+  var lastFrames = new WeakMap()
+  var frameCanvas = null
 
   // ---------------------------------------------------------------- utils
 
@@ -165,6 +186,48 @@
     return { selector: describeEl(el), text: text }
   }
 
+  // Walks up through shadow hosts and iframe elements, not just parentNode.
+  function parentOf(n) {
+    if (n.parentNode) return n.parentNode
+    if (n.nodeType === 11 && n.host) return n.host
+    if (n.nodeType === 9) {
+      try { return (n.defaultView && n.defaultView.frameElement) || null } catch (e) { return null }
+    }
+    return null
+  }
+
+  // The innermost target, even across open shadow boundaries.
+  function realTarget(e) {
+    var path = e.composedPath ? e.composedPath() : null
+    return (path && path[0]) || e.target
+  }
+
+  function frameDoc(iframe) {
+    try {
+      var doc = iframe.contentDocument
+      return doc && doc.documentElement ? doc : null
+    } catch (e) {
+      return null // cross-origin
+    }
+  }
+
+  // Offset of a (same-origin, possibly nested) iframe document within the top-level viewport.
+  function frameOffset(doc) {
+    var x = 0
+    var y = 0
+    try {
+      var win = doc.defaultView
+      while (win && win !== window && win.frameElement) {
+        var fe = win.frameElement
+        var r = fe.getBoundingClientRect()
+        x += r.left + fe.clientLeft
+        y += r.top + fe.clientTop
+        win = fe.ownerDocument.defaultView
+      }
+    } catch (e) { /* ignore */ }
+    return { x: x, y: y }
+  }
+
   // ---------------------------------------------------------------- events
 
   function emit(type, data, t) {
@@ -209,8 +272,104 @@
   }
 
   function isInsideBlocked(n) {
-    for (; n; n = n.parentNode) if (blockedNodes.has(n)) return true
+    for (; n; n = parentOf(n)) if (blockedNodes.has(n)) return true
     return false
+  }
+
+  // ---------------------------------------------------------------- stylesheets
+
+  function sheetText(sheet) {
+    try {
+      var rules = sheet && sheet.cssRules
+      if (!rules || !rules.length) return null
+      var out = ''
+      for (var i = 0; i < rules.length; i++) out += rules[i].cssText + '\n'
+      return absCss(out, sheet.href || undefined)
+    } catch (e) {
+      return null // cross-origin sheet without CORS
+    }
+  }
+
+  // Constructed sheets are shared (e.g. one per component class), so their CSS is sent once per snapshot.
+  function sheetRef(sheet) {
+    var id = sheetIds.get(sheet)
+    if (!id) {
+      id = nextSheetId++
+      sheetIds.set(sheet, id)
+    }
+    var ref = { id: id }
+    if (!sheetsSent.has(sheet)) {
+      sheetsSent.add(sheet)
+      ref.css = sheetText(sheet) || ''
+    }
+    return ref
+  }
+
+  function serializeAdopted(root) {
+    try {
+      var list = root.adoptedStyleSheets
+      if (!list || !list.length) return undefined
+      return Array.prototype.map.call(list, sheetRef)
+    } catch (e) {
+      return undefined
+    }
+  }
+
+  function notifySheet(sheet, data) {
+    if (!active) return
+    var id = sheetIds.get(sheet)
+    if (!id) return
+    data.sheetId = id
+    emit('style', data)
+  }
+
+  // ---------------------------------------------------------------- canvas + media
+
+  function replayableMedia(el) {
+    return !el.srcObject && /^https?:/i.test(el.currentSrc || el.src || '')
+  }
+
+  function mediaState(el) {
+    return {
+      paused: el.paused,
+      time: Math.round(el.currentTime * 100) / 100,
+      rate: el.playbackRate,
+      muted: el.muted,
+      volume: el.volume,
+      loop: el.loop
+    }
+  }
+
+  function captureFrame(el) {
+    try {
+      if (el.tagName === 'VIDEO') {
+        if (el.readyState < 2 || !el.videoWidth) return null
+        var scale = Math.min(1, 640 / el.videoWidth)
+        var c = frameCanvas || (frameCanvas = document.createElement('canvas'))
+        c.width = Math.round(el.videoWidth * scale)
+        c.height = Math.round(el.videoHeight * scale)
+        c.getContext('2d').drawImage(el, 0, 0, c.width, c.height)
+        return c.toDataURL('image/webp', config.canvasQuality)
+      }
+      if (!el.width || !el.height) return null
+      return el.toDataURL('image/webp', config.canvasQuality)
+    } catch (e) {
+      return null // tainted by cross-origin content
+    }
+  }
+
+  function sampleCanvases() {
+    if (!active) return
+    canvases.forEach(function (el) {
+      if (!el.isConnected) { canvases.delete(el); return }
+      var id = nodeIds.get(el)
+      if (!id || isInsideBlocked(el)) return
+      if (el.tagName === 'VIDEO' && el.paused && lastFrames.has(el)) return
+      var frame = captureFrame(el)
+      if (!frame || frame === lastFrames.get(el)) return
+      lastFrames.set(el, frame)
+      emit('canvas', { id: id, data: frame })
+    })
   }
 
   // ---------------------------------------------------------------- DOM serialization
@@ -219,7 +378,14 @@
     var id = nextNodeId++
     nodeIds.set(n, id)
     switch (n.nodeType) {
-      case 9: return { id: id, type: 9, childNodes: serializeChildren(n) }
+      case 9:
+      case 11: {
+        var root = { id: id, type: n.nodeType, childNodes: serializeChildren(n) }
+        var adopted = serializeAdopted(n)
+        if (adopted) root.adopted = adopted
+        observeRoot(n)
+        return root
+      }
       case 10: return { id: id, type: 10, name: n.name || 'html', publicId: n.publicId || '', systemId: n.systemId || '' }
       case 1: return serializeElement(n, id)
       case 3:
@@ -256,18 +422,6 @@
     if (name === 'style') return absCss(value)
     if (URL_ATTRS[name]) return absUrl(value)
     return value
-  }
-
-  function sheetText(sheet) {
-    try {
-      var rules = sheet && sheet.cssRules
-      if (!rules || !rules.length) return null
-      var out = ''
-      for (var i = 0; i < rules.length; i++) out += rules[i].cssText + '\n'
-      return absCss(out, sheet.href || undefined)
-    } catch (e) {
-      return null // cross-origin sheet
-    }
   }
 
   function serializeElement(el, id) {
@@ -308,8 +462,31 @@
       var css = sheetText(el.sheet)
       if (css) node.cssText = css
     }
+    if (tag === 'link' && config.inlineStylesheets && STYLESHEET_RE.test(el.rel || '')) {
+      var linked = sheetText(el.sheet)
+      if (linked != null) node.cssText = linked
+    }
 
-    node.childNodes = tag === 'iframe' ? [] : serializeChildren(el)
+    if (tag === 'iframe' || tag === 'frame') {
+      node.childNodes = []
+      var doc = config.recordIframes && frameDoc(el)
+      if (doc) node.doc = serializeNode(doc)
+      return node
+    }
+
+    if ((tag === 'video' || tag === 'audio') && config.recordMedia) node.media = mediaState(el)
+    if (config.recordCanvas && (tag === 'canvas' || (tag === 'video' && !replayableMedia(el)))) {
+      canvases.add(el)
+      var frame = captureFrame(el)
+      if (frame) {
+        node.canvas = frame
+        lastFrames.set(el, frame)
+      }
+    }
+
+    node.childNodes = serializeChildren(el)
+    var shadow = el.shadowRoot || closedRoots.get(el)
+    if (shadow) node.shadow = serializeNode(shadow)
     return node
   }
 
@@ -318,6 +495,7 @@
     if (observer) observer.takeRecords()
     nodeIds = new WeakMap()
     blockedNodes = new WeakSet()
+    sheetsSent = new WeakSet()
     nextNodeId = 1
     emit('snapshot', {
       node: serializeNode(document),
@@ -330,8 +508,18 @@
 
   // ---------------------------------------------------------------- DOM mutations
 
+  var MUTATION_OPTIONS = { childList: true, subtree: true, attributes: true, characterData: true }
+
+  // Documents (main + iframes) and shadow roots each need their own observation and listeners.
+  function observeRoot(root) {
+    if (observer) {
+      try { observer.observe(root, MUTATION_OPTIONS) } catch (e) { /* ignore */ }
+    }
+    addRootListeners(root)
+  }
+
   function hasAncestorIn(n, set) {
-    for (var p = n.parentNode; p; p = p.parentNode) if (set.has(p)) return true
+    for (var p = parentOf(n); p; p = parentOf(p)) if (set.has(p)) return true
     return false
   }
 
@@ -387,8 +575,10 @@
       if (!progressed) { needFull = needFull || pending.size > 0; break }
     }
 
-    if (needFull) {
+    // Fall back to a full snapshot, but never more than once every 5s to avoid snapshot storms.
+    if (needFull && now() - lastFallbackSnapshot > 5000) {
       debug('mutation ordering failed, taking full snapshot')
+      lastFallbackSnapshot = now()
       takeFullSnapshot()
       return
     }
@@ -427,41 +617,125 @@
   }
 
   function startDomRecording() {
+    if (window.MutationObserver) observer = new MutationObserver(safe(onMutations))
+    patchShadowDom()
+    patchCssom()
+    if (config.recordCanvas) patchCanvasContext()
     takeFullSnapshot()
-    if (window.MutationObserver) {
-      observer = new MutationObserver(safe(onMutations))
-      observer.observe(document, { childList: true, subtree: true, attributes: true, characterData: true })
-    }
     // The parser can grow text nodes without firing mutations, so re-snapshot once parsing ends.
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', safe(takeFullSnapshot))
     }
-    patchCssom()
+    if (config.recordCanvas) {
+      canvasTimer = setInterval(safe(sampleCanvases), Math.max(50, Math.round(1000 / config.canvasFps)))
+    }
+  }
+
+  function patchShadowDom() {
+    if (patched.shadow || !window.Element || !Element.prototype.attachShadow) return
+    patched.shadow = true
+    var attachShadow = Element.prototype.attachShadow
+    Element.prototype.attachShadow = function () {
+      var root = attachShadow.apply(this, arguments)
+      try {
+        if (root.mode === 'closed') closedRoots.set(this, root)
+        // A host that is already recorded gets its (still empty) root now; children follow as mutations.
+        var hostId = active && nodeIds.get(this)
+        if (hostId && !isInsideBlocked(this)) emit('shadow', { hostId: hostId, node: serializeNode(root) })
+      } catch (e) { /* ignore */ }
+      return root
+    }
   }
 
   function patchCssom() {
     if (patched.cssom || !window.CSSStyleSheet) return
     patched.cssom = true
     var proto = CSSStyleSheet.prototype
+
+    function ruleTarget(sheet) {
+      var owner = sheet.ownerNode
+      if (owner) {
+        var id = nodeIds.get(owner)
+        return id && !isInsideBlocked(owner) ? { id: id } : null
+      }
+      var sheetId = sheetIds.get(sheet)
+      return sheetId ? { sheetId: sheetId } : null
+    }
+
     var insertRule = proto.insertRule
-    var deleteRule = proto.deleteRule
-    proto.insertRule = function (rule, index) {
+    proto.insertRule = function (rule) {
       var result = insertRule.apply(this, arguments)
       try {
-        var owner = active && this.ownerNode
-        var id = owner && nodeIds.get(owner)
-        if (id && !isInsideBlocked(owner)) emit('style', { id: id, rule: absCss(String(rule), this.href || undefined), index: result })
+        var target = active && ruleTarget(this)
+        if (target) {
+          target.rule = absCss(String(rule), this.href || undefined)
+          target.index = result
+          emit('style', target)
+        }
       } catch (e) { /* ignore */ }
       return result
     }
+    var deleteRule = proto.deleteRule
     proto.deleteRule = function (index) {
       var result = deleteRule.apply(this, arguments)
       try {
-        var owner = active && this.ownerNode
-        var id = owner && nodeIds.get(owner)
-        if (id && !isInsideBlocked(owner)) emit('style', { id: id, remove: index })
+        var target = active && ruleTarget(this)
+        if (target) {
+          target.remove = index
+          emit('style', target)
+        }
       } catch (e) { /* ignore */ }
       return result
+    }
+    if (proto.replaceSync) {
+      var replaceSync = proto.replaceSync
+      proto.replaceSync = function (text) {
+        var result = replaceSync.apply(this, arguments)
+        try { notifySheet(this, { css: absCss(String(text)) }) } catch (e) { /* ignore */ }
+        return result
+      }
+    }
+    if (proto.replace) {
+      var replace = proto.replace
+      proto.replace = function () {
+        var sheet = this
+        var promise = replace.apply(this, arguments)
+        promise.then(function () {
+          try { notifySheet(sheet, { css: sheetText(sheet) || '' }) } catch (e) { /* ignore */ }
+        }, function () {})
+        return promise
+      }
+    }
+
+    // document.adoptedStyleSheets = [...] / shadowRoot.adoptedStyleSheets = [...]
+    ;[window.Document && Document.prototype, window.ShadowRoot && ShadowRoot.prototype].forEach(function (p) {
+      var desc = p && Object.getOwnPropertyDescriptor(p, 'adoptedStyleSheets')
+      if (!desc || !desc.set || !desc.configurable) return
+      Object.defineProperty(p, 'adoptedStyleSheets', {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: desc.get,
+        set: function (value) {
+          desc.set.call(this, value)
+          try {
+            var id = active && nodeIds.get(this)
+            if (id && !isInsideBlocked(this)) emit('adopted', { id: id, sheets: serializeAdopted(this) || [] })
+          } catch (e) { /* ignore */ }
+        }
+      })
+    })
+  }
+
+  // WebGL clears its drawing buffer after each frame unless asked not to, which makes it unreadable.
+  function patchCanvasContext() {
+    if (patched.canvas || !window.HTMLCanvasElement) return
+    patched.canvas = true
+    var getContext = HTMLCanvasElement.prototype.getContext
+    HTMLCanvasElement.prototype.getContext = function (type, attributes) {
+      if (active && /webgl/i.test(String(type))) {
+        return getContext.call(this, type, Object.assign({}, attributes, { preserveDrawingBuffer: true }))
+      }
+      return getContext.apply(this, arguments)
     }
   }
 
@@ -472,19 +746,29 @@
   var lastMove = 0
   var resizeTimer = null
 
+  // Composed events reach several root listeners; record each event once.
+  function claim(e) {
+    if (handledEvents.has(e)) return false
+    handledEvents.add(e)
+    return true
+  }
+
   function onInput(e) {
-    if (!active) return
-    var t = e.target
-    var id = nodeIds.get(t)
-    if (!id || isInsideBlocked(t)) return
+    if (!active || handledEvents.has(e)) return
+    var t = realTarget(e)
+    var id = t && nodeIds.get(t)
+    // Inside a closed shadow root the document only sees the host; the root's own listener records it.
+    if (!id || isInsideBlocked(t) || !('value' in t)) return
+    claim(e)
     var type = (t.type || '').toLowerCase()
     if (type === 'checkbox' || type === 'radio') emit('input', { id: id, checked: !!t.checked })
-    else if ('value' in t && type !== 'file') emit('input', { id: id, value: inputValue(t) })
+    else if (type !== 'file') emit('input', { id: id, value: inputValue(t) })
   }
 
   function onScroll(e) {
     if (!active) return
-    var target = e.target === document || e.target === window ? document : e.target
+    var target = e.target
+    if (target && target.nodeType !== 1 && target.nodeType !== 9) target = target.document || document
     var id = nodeIds.get(target)
     if (!id) return
     scrollPending.set(target, id)
@@ -494,10 +778,20 @@
   function flushScroll() {
     scrollTimer = null
     scrollPending.forEach(function (id, target) {
-      if (target === document) emit('scroll', { id: id, x: Math.round(window.scrollX), y: Math.round(window.scrollY) })
-      else emit('scroll', { id: id, x: Math.round(target.scrollLeft), y: Math.round(target.scrollTop) })
+      if (target.nodeType === 9) {
+        var win = target.defaultView || window
+        emit('scroll', { id: id, x: Math.round(win.scrollX), y: Math.round(win.scrollY) })
+      } else {
+        emit('scroll', { id: id, x: Math.round(target.scrollLeft), y: Math.round(target.scrollTop) })
+      }
     })
     scrollPending.clear()
+  }
+
+  function pointerOffset(e) {
+    var t = e.target
+    var doc = t && (t.ownerDocument || (t.nodeType === 9 ? t : null))
+    return doc && doc !== document ? frameOffset(doc) : { x: 0, y: 0 }
   }
 
   function onMove(e) {
@@ -505,19 +799,51 @@
     if (!active || t - lastMove < 50) return
     lastMove = t
     var p = e.touches ? e.touches[0] : e
-    if (p) emit('mouse', { x: Math.round(p.clientX), y: Math.round(p.clientY) })
+    if (!p) return
+    var off = pointerOffset(e)
+    emit('mouse', { x: Math.round(p.clientX + off.x), y: Math.round(p.clientY + off.y) })
   }
 
   function onClick(e) {
-    if (!active) return
-    var label = elementLabel(e.target)
-    var data = { id: nodeIds.get(e.target) || null, selector: label.selector, text: label.text }
+    if (!active || !claim(e)) return
+    var target = realTarget(e)
+    var label = elementLabel(target)
+    var data = { id: nodeIds.get(target) || null, selector: label.selector, text: label.text }
     // Keyboard-activated and programmatic clicks (detail 0) have no real pointer position.
     if (e.detail !== 0) {
-      data.x = Math.round(e.clientX)
-      data.y = Math.round(e.clientY)
+      var off = pointerOffset(e)
+      data.x = Math.round(e.clientX + off.x)
+      data.y = Math.round(e.clientY + off.y)
     }
     emit('click', data)
+  }
+
+  function onMedia(e) {
+    if (!active) return
+    var t = e.target
+    if (!t || (t.tagName !== 'VIDEO' && t.tagName !== 'AUDIO')) return
+    var id = nodeIds.get(t)
+    if (!id || isInsideBlocked(t)) return
+    var state = mediaState(t)
+    state.id = id
+    state.action = e.type
+    emit('media', state)
+  }
+
+  // Load events don't bubble but are visible to capturing listeners: re-record iframes and linked CSS.
+  function onResourceLoad(e) {
+    if (!active) return
+    var t = e.target
+    if (!t || t.nodeType !== 1) return
+    var id = nodeIds.get(t)
+    if (!id || isInsideBlocked(t)) return
+    if (t.tagName === 'IFRAME' || t.tagName === 'FRAME') {
+      var doc = config.recordIframes && frameDoc(t)
+      if (doc) emit('iframe', { id: id, node: serializeNode(doc) })
+    } else if (t.tagName === 'LINK' && config.inlineStylesheets && STYLESHEET_RE.test(t.rel || '')) {
+      var css = sheetText(t.sheet)
+      if (css != null) emit('style', { id: id, css: css })
+    }
   }
 
   function onResize() {
@@ -528,17 +854,25 @@
     }), 200)
   }
 
-  function startInteractionRecording() {
-    if (patched.interactions) return
-    patched.interactions = true
+  function addRootListeners(root) {
+    if (listenedRoots.has(root) || !config) return
+    listenedRoots.add(root)
     var opts = { capture: true, passive: true }
-    document.addEventListener('input', safe(onInput), opts)
-    document.addEventListener('change', safe(onInput), opts)
-    document.addEventListener('scroll', safe(onScroll), opts)
-    document.addEventListener('mousemove', safe(onMove), opts)
-    document.addEventListener('touchmove', safe(onMove), opts)
-    document.addEventListener('click', safe(onClick), opts)
-    window.addEventListener('resize', safe(onResize), { passive: true })
+    var isDocument = root.nodeType === 9
+    root.addEventListener('load', safe(onResourceLoad), opts)
+    if (config.recordMedia) {
+      MEDIA_EVENTS.forEach(function (type) { root.addEventListener(type, safe(onMedia), opts) })
+    }
+    if (config.recordInteractions) {
+      root.addEventListener('input', safe(onInput), opts)
+      root.addEventListener('change', safe(onInput), opts)
+      root.addEventListener('scroll', safe(onScroll), opts)
+      if (isDocument) {
+        root.addEventListener('mousemove', safe(onMove), opts)
+        root.addEventListener('touchmove', safe(onMove), opts)
+        root.addEventListener('click', safe(onClick), opts)
+      }
+    }
   }
 
   // ---------------------------------------------------------------- console + errors
@@ -991,8 +1325,9 @@
 
     emit('meta', collectMeta())
     if (identity) emit('identify', identity)
+    addRootListeners(document)
+    if (config.recordInteractions) window.addEventListener('resize', safe(onResize), { passive: true })
     if (config.recordDom) startDomRecording()
-    if (config.recordInteractions) startInteractionRecording()
     if (config.recordConsole) patchConsole()
     if (config.recordErrors) patchErrors()
     if (config.recordNetwork) { patchFetch(); patchXhr() }
@@ -1035,6 +1370,7 @@
     active = false
     if (observer) { observer.disconnect(); observer = null }
     if (flushTimer) { clearInterval(flushTimer); flushTimer = null }
+    if (canvasTimer) { clearInterval(canvasTimer); canvasTimer = null }
   }
 
   function getSessionURL() {
@@ -1074,6 +1410,7 @@
       appId: script.getAttribute('data-app-id'),
       endpoint: endpoint,
       maskAllInputs: script.hasAttribute('data-mask-all-inputs'),
+      recordCanvas: script.hasAttribute('data-record-canvas'),
       debug: script.hasAttribute('data-debug')
     })
   }

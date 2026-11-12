@@ -1,0 +1,13 @@
+/* Linked stylesheet: inlined by the recorder, its image archived by the server. */
+.hero {
+  height: 60px;
+  border-radius: 8px;
+  background: #eef2ff url("pattern.svg") repeat;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  color: #3730a3;
+}
+canvas, video { border: 1px solid #ddd; border-radius: 6px; max-width: 100%; }
+iframe { width: 100%; height: 150px; border: 1px solid #ddd; border-radius: 6px; }

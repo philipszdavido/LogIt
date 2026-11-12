@@ -5,7 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LogIt Demo Shop</title>
   <!-- One-line install: records into app "demo" and sends to this server's /api/ingest -->
-  <script src="/sdk/logit.js" data-app-id="demo"></script>
+  <script src="/sdk/logit.js" data-app-id="demo" data-record-canvas></script>
+  <link rel="stylesheet" href="demo.css">
   <style>
     body { font: 15px/1.5 system-ui, sans-serif; margin: 0; background: #fafafa; color: #222; }
     header { background: #4f46e5; color: #fff; padding: 14px 24px; display: flex; justify-content: space-between; align-items: center; }
@@ -75,6 +76,28 @@
     </section>
 
     <section>
+      <h2>Shadow DOM &amp; constructed styles</h2>
+      <logit-counter id="counter"></logit-counter>
+      <secret-field id="secret-field"></secret-field>
+      <div class="hero">Linked stylesheet + archived image</div>
+    </section>
+
+    <section>
+      <h2>Same-origin iframe</h2>
+      <iframe id="widget" src="frame.html" title="Embedded widget"></iframe>
+    </section>
+
+    <section>
+      <h2>Canvas &amp; video</h2>
+      <canvas id="canvas" width="200" height="100"></canvas>
+      <video id="video" width="200" height="100" muted playsinline></video>
+      <div>
+        <button id="canvas-toggle" class="secondary">Pause animation</button>
+        <button id="video-toggle" class="secondary">Play video</button>
+      </div>
+    </section>
+
+    <section>
       <h2>SPA navigation</h2>
       <button id="nav-a" class="secondary">Go to /demo/#products</button>
       <button id="nav-b" class="secondary">pushState /demo/?page=cart</button>
@@ -132,6 +155,61 @@
     $('nav-b').onclick = () => { history.pushState({}, '', '/demo/?page=cart'); renderRoute() }
     window.addEventListener('hashchange', renderRoute)
     renderRoute()
+
+    // Open shadow root styled through a constructable stylesheet shared by every instance.
+    const counterSheet = new CSSStyleSheet()
+    counterSheet.replaceSync('button { background: #be185d; color: #fff; border: 0; border-radius: 6px; padding: 6px 10px; } span { font-weight: 700; margin-left: 8px; }')
+    customElements.define('logit-counter', class extends HTMLElement {
+      constructor() {
+        super()
+        const root = this.attachShadow({ mode: 'open' })
+        root.adoptedStyleSheets = [counterSheet]
+        root.innerHTML = '<button part="button">Increment</button><span>0</span>'
+        root.querySelector('button').addEventListener('click', () => {
+          const span = root.querySelector('span')
+          span.textContent = String(Number(span.textContent) + 1)
+        })
+      }
+    })
+
+    // Closed shadow root: invisible to page scripts, still recorded.
+    customElements.define('secret-field', class extends HTMLElement {
+      constructor() {
+        super()
+        const root = this.attachShadow({ mode: 'closed' })
+        root.innerHTML = '<p>Closed shadow root: <input placeholder="Type here"></p>'
+      }
+    })
+
+    // Animated 2D canvas, and a <video> fed from a MediaStream (not replayable from a URL).
+    const canvas = $('canvas')
+    const ctx = canvas.getContext('2d')
+    let x = 20, dx = 2, running = true
+    function draw() {
+      ctx.fillStyle = '#fff7ed'
+      ctx.fillRect(0, 0, canvas.width, canvas.height)
+      ctx.fillStyle = '#ea580c'
+      ctx.beginPath()
+      ctx.arc(x, 50, 18, 0, Math.PI * 2)
+      ctx.fill()
+      if (running) {
+        x += dx
+        if (x > 180 || x < 20) dx = -dx
+      }
+      requestAnimationFrame(draw)
+    }
+    draw()
+    $('canvas-toggle').onclick = () => {
+      running = !running
+      $('canvas-toggle').textContent = running ? 'Pause animation' : 'Resume animation'
+    }
+    if (canvas.captureStream) $('video').srcObject = canvas.captureStream(15)
+    $('video-toggle').onclick = () => {
+      const v = $('video')
+      if (v.paused) v.play()
+      else v.pause()
+      $('video-toggle').textContent = v.paused ? 'Play video' : 'Pause video'
+    }
   </script>
 </body>
 </html>

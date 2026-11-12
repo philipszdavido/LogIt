@@ -73,6 +73,11 @@ async function launch(chromePath) {
     async type(text) {
       await cdp.send('Input.insertText', { text })
     },
+    async press(key, code, keyCode) {
+      for (const type of ['keyDown', 'keyUp']) {
+        await cdp.send('Input.dispatchKeyEvent', { type, key, code, windowsVirtualKeyCode: keyCode })
+      }
+    },
     async click(x, y) {
       for (const type of ['mousePressed', 'mouseReleased']) {
         await cdp.send('Input.dispatchMouseEvent', { type, x, y, button: 'left', clickCount: 1 })

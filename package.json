@@ -10,9 +10,12 @@
   },
   "scripts": {
     "start": "node server/index.js",
-    "test": "node --test --test-timeout=120000 test/server.test.js test/e2e.test.js",
-    "test:server": "node --test test/server.test.js",
+    "test": "node --test --test-timeout=120000 test/server.test.js test/assets.test.js test/store.test.js test/e2e.test.js",
+    "test:server": "node --test test/server.test.js test/assets.test.js test/store.test.js",
     "test:e2e": "node --test --test-timeout=120000 test/e2e.test.js",
-    "check": "node --check src/recorder.js && node --check src/replayer.js && node --check viewer/app.js && node --check server/index.js && node --check server/store.js"
+    "check": "node --check src/recorder.js && node --check src/replayer.js && node --check viewer/app.js && node --check server/index.js && node --check server/store.js && node --check server/pg-store.js && node --check server/meta.js && node --check server/assets.js"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
   }
 }

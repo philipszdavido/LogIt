@@ -70,7 +70,24 @@ test('records a session on the demo page', { skip: !chromePath && 'Chrome not fo
   await browser.evaluate("document.getElementById('track').click()")
   await browser.evaluate("document.querySelector('#login-form button').click()")
   await browser.evaluate("document.getElementById('nav-b').click()")
-  await browser.evaluate('new Promise(r => setTimeout(r, 400))')
+
+  // Shadow DOM: an open root, then Tab from it into the closed root's input (unreachable from page JS).
+  await browser.evaluate("document.getElementById('counter').shadowRoot.querySelector('button').click()")
+  await browser.evaluate("document.getElementById('counter').shadowRoot.querySelector('button').click()")
+  await browser.evaluate("document.getElementById('counter').shadowRoot.querySelector('button').focus()")
+  await browser.press('Tab', 'Tab', 9)
+  await browser.type('closed-root-text')
+
+  // Same-origin iframe.
+  await browser.waitFor("document.getElementById('widget').contentDocument.getElementById('frame-add')")
+  await browser.evaluate("document.getElementById('widget').contentDocument.getElementById('frame-add').click()")
+  await browser.evaluate("document.getElementById('widget').contentDocument.getElementById('frame-add').click()")
+  await browser.evaluate("document.getElementById('widget').contentDocument.getElementById('frame-input').focus()")
+  await browser.type('typed in iframe')
+
+  // Media + canvas: play the stream-backed video and let a few canvas frames be sampled.
+  await browser.evaluate("document.getElementById('video-toggle').click()")
+  await browser.evaluate('new Promise(r => setTimeout(r, 1200))')
 
   await browser.evaluate('LogIt.flush()')
 
@@ -108,6 +125,32 @@ test('captured every kind of event', { skip: !chromePath && 'Chrome not found' }
 
   assert.equal(meta.user.id, 'ada@example.com')
   assert.ok(meta.errorCount >= 3)
+})
+
+test('captured shadow DOM, iframes, canvas, media and stylesheets', { skip: !chromePath && 'Chrome not found' }, () => {
+  const { events } = session
+  const ofType = type => events.filter(e => e.type === type)
+  const snapshots = JSON.stringify(ofType('snapshot'))
+
+  assert.ok(snapshots.includes('"shadow"'), 'shadow roots serialized')
+  assert.ok(snapshots.includes('"adopted"'), 'adopted stylesheets serialized')
+  assert.ok(snapshots.includes('"doc"') || ofType('iframe').length, 'iframe document serialized')
+  assert.ok(snapshots.includes('pattern.svg'), 'linked stylesheet inlined')
+  assert.ok(ofType('input').some(e => e.data.value === 'closed-root-text'), 'input inside closed shadow root')
+  assert.ok(ofType('input').some(e => e.data.value === 'typed in iframe'), 'input inside iframe')
+  assert.ok(ofType('canvas').length >= 1, 'canvas frames')
+  assert.ok(ofType('canvas').every(e => e.data.data.startsWith('data:image/')), 'frames are images')
+  assert.ok(ofType('media').some(e => e.data.action === 'play'), 'media play event')
+})
+
+test('archived the page assets on the server', { skip: !chromePath && 'Chrome not found' }, async () => {
+  await app.archiver.drain()
+  const res = await fetch(`${app.url}/api/sessions/demo/${sessionId}`, { headers: { Authorization: 'Bearer ' + TOKEN } })
+  const { assets } = await res.json()
+  const hash = assets[app.url + '/demo/pattern.svg']
+  assert.match(hash || '', /^[a-f0-9]{64}$/)
+  const asset = await fetch(app.url + '/assets/' + hash)
+  assert.equal(asset.headers.get('content-type'), 'image/svg+xml')
 })
 
 test('masks and blocks sensitive content', { skip: !chromePath && 'Chrome not found' }, () => {
@@ -149,6 +192,40 @@ test('replays the session in the viewer', { skip: !chromePath && 'Chrome not fou
   assert.equal(end.scripts, true)
   assert.equal(end.blocked, '')
   assert.equal(end.title, 'LogIt Demo Shop')
+
+  // Shadow DOM, constructed stylesheets, iframes, canvas, video and archived assets.
+  const rich = await browser.evaluate(`(() => {
+    const doc = window.logitViewer.replayer.getDocument()
+    const counter = doc.getElementById('counter').shadowRoot
+    const secret = doc.getElementById('secret-field').shadowRoot
+    const frameDoc = doc.getElementById('widget').contentDocument
+    return {
+      count: counter.querySelector('span').textContent,
+      counterColor: doc.defaultView.getComputedStyle(counter.querySelector('button')).backgroundColor,
+      secretValue: secret.querySelector('input').value,
+      frameRows: frameDoc.querySelectorAll('#frame-list li').length,
+      frameInput: frameDoc.getElementById('frame-input').value,
+      poster: (doc.getElementById('video').getAttribute('poster') || '').slice(0, 11),
+      heroBackground: doc.defaultView.getComputedStyle(doc.querySelector('.hero')).backgroundImage,
+      linkedStylesheets: doc.querySelectorAll('link[rel=stylesheet]').length
+    }
+  })()`)
+  assert.equal(rich.count, '2')
+  assert.equal(rich.counterColor, 'rgb(190, 24, 93)')
+  assert.equal(rich.secretValue, 'closed-root-text')
+  assert.equal(rich.frameRows, 2)
+  assert.equal(rich.frameInput, 'typed in iframe')
+  assert.equal(rich.poster, 'data:image/')
+  assert.equal(rich.linkedStylesheets, 0)
+  assert.match(rich.heroBackground, /\/assets\/[a-f0-9]{64}/)
+
+  // Canvas frames are decoded asynchronously.
+  await browser.waitFor(`(() => {
+    const c = window.logitViewer.replayer.getDocument().getElementById('canvas')
+    const px = c.getContext('2d').getImageData(0, 0, c.width, c.height).data
+    for (let i = 0; i < px.length; i += 4) if (px[i] > 200 && px[i + 1] < 120 && px[i + 2] < 60) return true
+    return false
+  })()`, 5000)
 
   // Seek back to the start: no todos yet.
   const start = await browser.evaluate(`(() => {

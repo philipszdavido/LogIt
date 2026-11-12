@@ -152,7 +152,7 @@ test('reloads the session index from disk', async () => {
   const { SessionStore } = require('../server/store')
   const store = new SessionStore(dataDir)
   await store.init()
-  assert.equal(store.getMeta('shop', 'sess-1').eventCount, 8)
+  assert.equal((await store.getMeta('shop', 'sess-1')).eventCount, 8)
 })
 
 test('refuses to start in production without a token', async () => {

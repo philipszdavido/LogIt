@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Embedded widget</title>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 10px; }
+    button { background: #0f766e; color: #fff; border: 0; border-radius: 6px; padding: 5px 10px; }
+  </style>
+</head>
+<body>
+  <strong>Same-origin iframe</strong>
+  <input id="frame-input" placeholder="Type inside the iframe">
+  <button id="frame-add">Add row</button>
+  <ol id="frame-list"></ol>
+  <script>
+    document.getElementById('frame-add').onclick = () => {
+      const li = document.createElement('li')
+      li.textContent = 'Row ' + (document.querySelectorAll('#frame-list li').length + 1)
+      document.getElementById('frame-list').appendChild(li)
+    }
+  </script>
+</body>
+</html>

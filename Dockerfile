@@ -3,7 +3,8 @@ ENV NODE_ENV=production \
     PORT=4000 \
     LOGIT_DATA_DIR=/data
 WORKDIR /app
-COPY package.json ./
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
 COPY server ./server
 COPY src ./src
 COPY viewer ./viewer
