@@ -1,8 +1,8 @@
 /*!
  * LogIt recorder SDK
- * Records DOM snapshots + mutations (including shadow DOM, same-origin iframes, canvas, media and
- * constructable stylesheets), user interactions, console output, errors, network requests and
- * performance data, and ships them in batches to a LogIt server.
+ * Records DOM snapshots + mutations (including shadow DOM, iframes, canvas, media and constructable
+ * stylesheets), user interactions, console output, errors, network requests and performance data,
+ * and ships them in batches to a LogIt server.
  *
  * Install (as early in <head> as possible):
  *   <script src="https://your-logit-host/sdk/logit.js" data-app-id="my-app"></script>
@@ -15,7 +15,7 @@
   if (window.LogIt && window.LogIt.__loaded) return
 
   var document = window.document
-  var VERSION = '1.1.0'
+  var VERSION = '1.3.0'
   var SVG_NS = 'http://www.w3.org/2000/svg'
   var STORAGE_KEY = 'logit_session'
   var ID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -23,6 +23,13 @@
   var STYLESHEET_RE = /(^|\s)stylesheet(\s|$)/i
   var URL_ATTRS = { href: 1, src: 1, action: 1, poster: 1, background: 1, 'xlink:href': 1, cite: 1, data: 1 }
   var MEDIA_EVENTS = ['play', 'pause', 'seeked', 'ratechange', 'volumechange']
+  // Events a cross-origin iframe streams to its recording parent instead of keeping them itself.
+  var RELAY_TYPES = {
+    snapshot: 1, mutation: 1, shadow: 1, iframe: 1, adopted: 1, style: 1, canvas: 1, media: 1, stream: 1,
+    input: 1, scroll: 1, mouse: 1, click: 1
+  }
+  var MANIFEST_RE = /\.(m3u8|mpd)(?:[?#]|$)/i
+  var MANIFEST_TYPE_RE = /mpegurl|dash\+xml/i
 
   var DEFAULTS = {
     appId: null,
@@ -41,11 +48,16 @@
     recordNetwork: true,
     recordPerformance: true,
     recordIframes: true,        // contents of same-origin iframes
+    recordCrossOriginIframes: true, // ask cross-origin iframes that run LogIt to stream their DOM here
+    parentOrigins: [],          // inside an iframe: parent origins allowed to receive this frame's DOM ('*' = any)
     recordMedia: true,          // <video>/<audio> play, pause, seek, rate and volume
     recordCanvas: false,        // <canvas> frames, and frames of <video> that cannot be replayed from a URL
     canvasFps: 2,
     canvasQuality: 0.6,
     inlineStylesheets: true,    // embed readable <link rel=stylesheet> CSS so replays survive deploys
+    uploadAssets: false,        // upload assets the server could not fetch itself (e.g. behind a login)
+    assetUploadMaxBytes: 5 * 1024 * 1024,
+    assetCredentialOrigins: [], // other origins whose assets are fetched with cookies for upload (they must allow it via CORS)
     consoleLevels: ['log', 'info', 'warn', 'error', 'debug'],
     maskAllInputs: false,
     maskInputTypes: ['password'],          // 'password' is always masked
@@ -100,6 +112,14 @@
   var canvases = new Set()
   var lastFrames = new WeakMap()
   var frameCanvas = null
+  var adoptedProxies = new WeakMap()  // document / shadow root -> { list, proxy } of its adoptedStyleSheets
+  var adoptedPending = null           // roots whose adoptedStyleSheets changed in place this microtask
+  var remoteFrames = new WeakMap()    // contentWindow of a cross-origin iframe -> { el, ids, sheets }
+  var parentLink = null               // inside a cross-origin iframe: the recording parent's origin
+  var uploadedAssets = new Set()
+  var mediaStreams = new WeakMap()    // MSE <video> -> the HLS / DASH manifest URL feeding it
+  var seenManifests = new Set()
+  var pendingManifests = []           // manifests fetched before any video was attached to a MediaSource
 
   // ---------------------------------------------------------------- utils
 
@@ -237,6 +257,10 @@
       try { event = config.beforeSend(event) } catch (e) { return }
       if (!event) return
     }
+    if (parentLink && RELAY_TYPES[event.type]) {
+      try { window.parent.postMessage({ __logit: 'events', events: [event] }, parentLink) } catch (e) { /* ignore */ }
+      return
+    }
     buffer.push(event)
     trimBuffer()
     if (config.endpoint && buffer.length >= config.maxBatchSize) scheduleFlush(0)
@@ -324,6 +348,43 @@
   }
 
   // ---------------------------------------------------------------- canvas + media
+
+  // ---------------------------------------------------------------- streams (HLS / DASH through MSE)
+  //
+  // A player like hls.js gives the <video> a blob: URL, so the element doesn't say what it plays. The manifest
+  // request does: it is matched to the video, and the server archives the stream as one playable file.
+
+  function isMse(el) {
+    return /^blob:/i.test(el.currentSrc || el.src || '')
+  }
+
+  function noteManifest(url) {
+    if (!active || !config.recordMedia || !url || seenManifests.has(url)) return
+    seenManifests.add(url)
+    var videos = document.getElementsByTagName('video')
+    for (var i = 0; i < videos.length; i++) {
+      if (!mediaStreams.has(videos[i]) && nodeIds.get(videos[i]) && isMse(videos[i])) return assignStream(videos[i], url)
+    }
+    pendingManifests.push(url)
+    if (pendingManifests.length > 10) pendingManifests.shift()
+  }
+
+  function assignStream(el, url) {
+    mediaStreams.set(el, url)
+    var id = nodeIds.get(el)
+    if (id && !isInsideBlocked(el)) emit('stream', { id: id, url: url })
+  }
+
+  // Manifests are seen through resource timing, which also covers requests made before LogIt patched fetch.
+  function watchManifests() {
+    if (patched.manifests || !window.PerformanceObserver) return
+    patched.manifests = true
+    try {
+      new PerformanceObserver(safe(function (list) {
+        list.getEntries().forEach(function (entry) { if (MANIFEST_RE.test(entry.name)) noteManifest(entry.name) })
+      })).observe({ type: 'resource', buffered: true })
+    } catch (e) { /* unsupported */ }
+  }
 
   function replayableMedia(el) {
     return !el.srcObject && /^https?:/i.test(el.currentSrc || el.src || '')
@@ -471,10 +532,18 @@
       node.childNodes = []
       var doc = config.recordIframes && frameDoc(el)
       if (doc) node.doc = serializeNode(doc)
+      else if (config.recordIframes && isCrossOriginFrame(el)) {
+        // The server archives this URL's HTML as a static stand-in, until (and unless) the frame streams its DOM.
+        node.remote = 1
+        linkRemoteFrame(el)
+      }
       return node
     }
 
-    if ((tag === 'video' || tag === 'audio') && config.recordMedia) node.media = mediaState(el)
+    if ((tag === 'video' || tag === 'audio') && config.recordMedia) {
+      node.media = mediaState(el)
+      if (mediaStreams.has(el)) node.stream = mediaStreams.get(el)
+    }
     if (config.recordCanvas && (tag === 'canvas' || (tag === 'video' && !replayableMedia(el)))) {
       canvases.add(el)
       var frame = captureFrame(el)
@@ -621,6 +690,7 @@
     patchShadowDom()
     patchCssom()
     if (config.recordCanvas) patchCanvasContext()
+    if (config.recordMedia) watchManifests()
     takeFullSnapshot()
     // The parser can grow text nodes without firing mutations, so re-snapshot once parsing ends.
     if (document.readyState === 'loading') {
@@ -707,23 +777,62 @@
       }
     }
 
-    // document.adoptedStyleSheets = [...] / shadowRoot.adoptedStyleSheets = [...]
+    // document.adoptedStyleSheets = [...] / shadowRoot.adoptedStyleSheets = [...], and in-place changes
+    // (push, splice, index assignment) made through the array the getter returns.
     ;[window.Document && Document.prototype, window.ShadowRoot && ShadowRoot.prototype].forEach(function (p) {
       var desc = p && Object.getOwnPropertyDescriptor(p, 'adoptedStyleSheets')
-      if (!desc || !desc.set || !desc.configurable) return
+      if (!desc || !desc.get || !desc.set || !desc.configurable) return
       Object.defineProperty(p, 'adoptedStyleSheets', {
         configurable: true,
         enumerable: desc.enumerable,
-        get: desc.get,
+        get: function () {
+          var list = desc.get.call(this)
+          try { return observedAdopted(this, list) } catch (e) { return list }
+        },
         set: function (value) {
           desc.set.call(this, value)
-          try {
-            var id = active && nodeIds.get(this)
-            if (id && !isInsideBlocked(this)) emit('adopted', { id: id, sheets: serializeAdopted(this) || [] })
-          } catch (e) { /* ignore */ }
+          try { emitAdopted(this) } catch (e) { /* ignore */ }
         }
       })
     })
+  }
+
+  function emitAdopted(root) {
+    var id = active && nodeIds.get(root)
+    if (id && !isInsideBlocked(root)) emit('adopted', { id: id, sheets: serializeAdopted(root) || [] })
+  }
+
+  // The browser's array can be changed in place, which no setter sees. Hand out a proxy (one per root, so
+  // identity checks still hold) that forwards every write to the real array and then reports the new list.
+  function observedAdopted(root, list) {
+    if (!list || typeof list !== 'object' || typeof Proxy === 'undefined') return list
+    var cached = adoptedProxies.get(root)
+    if (cached && cached.list === list) return cached.proxy
+    var changed = function () {
+      if (!adoptedPending) {
+        adoptedPending = new Set()
+        Promise.resolve().then(safe(function () {
+          var roots = adoptedPending
+          adoptedPending = null
+          roots.forEach(emitAdopted)
+        }))
+      }
+      adoptedPending.add(root)
+    }
+    var proxy = new Proxy(list, {
+      set: function (target, prop, value) {
+        var ok = Reflect.set(target, prop, value)
+        if (ok) changed()
+        return ok
+      },
+      deleteProperty: function (target, prop) {
+        var ok = Reflect.deleteProperty(target, prop)
+        if (ok) changed()
+        return ok
+      }
+    })
+    adoptedProxies.set(root, { list: list, proxy: proxy })
+    return proxy
   }
 
   // WebGL clears its drawing buffer after each frame unless asked not to, which makes it unreadable.
@@ -736,6 +845,175 @@
         return getContext.call(this, type, Object.assign({}, attributes, { preserveDrawingBuffer: true }))
       }
       return getContext.apply(this, arguments)
+    }
+  }
+
+  // ---------------------------------------------------------------- cross-origin iframes
+  //
+  // A cross-origin iframe's DOM can't be read from here, but when the frame runs LogIt too (with this page's
+  // origin in its parentOrigins) it streams its DOM events to us. Its node and sheet ids are remapped into
+  // this page's id space, so a frame can only ever address its own nodes.
+
+  function isCrossOriginFrame(el) {
+    try { return !!el.contentWindow && !el.contentDocument } catch (e) { return true }
+  }
+
+  function linkRemoteFrame(el) {
+    if (!config.recordCrossOriginIframes) return
+    var win = el.contentWindow
+    if (!win) return
+    remoteFrames.set(win, { el: el, ids: null, sheets: null, live: false }) // events are ignored until the frame's snapshot
+    try { win.postMessage({ __logit: 'request' }, '*') } catch (e) { /* ignore */ }
+  }
+
+  // A cross-origin frame finished loading. If it streamed a snapshot since it started loading, it runs LogIt;
+  // otherwise record its URL so the server archives the HTML and the replay shows a static copy.
+  function onRemoteFrameLoad(el, id) {
+    var state = remoteFrames.get(el.contentWindow)
+    if (state && state.live) {
+      state.live = false
+      return
+    }
+    var src = el.getAttribute('src')
+    if (src) emit('iframe', { id: id, url: absUrl(src) })
+    linkRemoteFrame(el)
+  }
+
+  function findFrameElement(win) {
+    var frames = document.getElementsByTagName('iframe')
+    for (var i = 0; i < frames.length; i++) if (frames[i].contentWindow === win) return frames[i]
+    return null
+  }
+
+  function onFrameMessage(e) {
+    var msg = e.data
+    if (!active || !e.source || !msg || typeof msg !== 'object' || typeof msg.__logit !== 'string') return
+    var state = remoteFrames.get(e.source)
+    if (msg.__logit === 'hello') {
+      // The frame (re)loaded LogIt, e.g. after navigating: ask it for a fresh snapshot.
+      var el = state ? state.el : findFrameElement(e.source)
+      if (el && nodeIds.get(el)) linkRemoteFrame(el)
+      return
+    }
+    if (msg.__logit !== 'events' || !state || !Array.isArray(msg.events)) return
+    if (!state.el.isConnected || !nodeIds.get(state.el) || isInsideBlocked(state.el)) return
+    for (var i = 0; i < msg.events.length && i < 1000; i++) relayFrameEvent(state, msg.events[i])
+  }
+
+  function remapId(state, id) {
+    if (typeof id !== 'number') return null
+    var mapped = state.ids.get(id)
+    if (!mapped) {
+      mapped = nextNodeId++
+      state.ids.set(id, mapped)
+    }
+    return mapped
+  }
+
+  function remapSheet(state, id) {
+    if (typeof id !== 'number') return null
+    var mapped = state.sheets.get(id)
+    if (!mapped) {
+      mapped = nextSheetId++
+      state.sheets.set(id, mapped)
+    }
+    return mapped
+  }
+
+  function remapNode(state, sn) {
+    if (!sn || typeof sn !== 'object') return null
+    sn.id = remapId(state, sn.id)
+    if (Array.isArray(sn.childNodes)) for (var i = 0; i < sn.childNodes.length; i++) remapNode(state, sn.childNodes[i])
+    if (sn.shadow) remapNode(state, sn.shadow)
+    if (sn.doc) remapNode(state, sn.doc)
+    if (Array.isArray(sn.adopted)) sn.adopted.forEach(function (r) { if (r) r.id = remapSheet(state, r.id) })
+    return sn
+  }
+
+  function eachOf(list, fn) {
+    if (Array.isArray(list)) list.forEach(function (x) { if (x && typeof x === 'object') fn(x) })
+  }
+
+  // Pointer positions inside the frame are relative to its viewport; make them relative to ours.
+  function offsetFrom(el, d) {
+    var r = el.getBoundingClientRect()
+    var base = frameOffset(el.ownerDocument)
+    if (typeof d.x === 'number') d.x = Math.round(d.x + base.x + r.left + el.clientLeft)
+    if (typeof d.y === 'number') d.y = Math.round(d.y + base.y + r.top + el.clientTop)
+  }
+
+  function relayFrameEvent(state, ev) {
+    if (!ev || typeof ev !== 'object' || !RELAY_TYPES[ev.type] || !ev.data || typeof ev.data !== 'object') return
+    var d = ev.data
+    var frameId = nodeIds.get(state.el)
+    if (ev.type === 'snapshot') {
+      state.ids = new Map()
+      state.sheets = new Map()
+      state.live = true
+      var root = remapNode(state, d.node)
+      if (!root) return
+      emit('iframe', { id: frameId, node: root })
+      if (d.scroll && (d.scroll.x || d.scroll.y)) emit('scroll', { id: root.id, x: d.scroll.x | 0, y: d.scroll.y | 0 })
+      return
+    }
+    if (!state.ids) return
+    var m = function (id) { return remapId(state, id) }
+    switch (ev.type) {
+      case 'mutation':
+        eachOf(d.adds, function (a) {
+          a.parentId = m(a.parentId)
+          a.nextId = a.nextId == null ? null : m(a.nextId)
+          remapNode(state, a.node)
+        })
+        eachOf(d.removes, function (r) { r.id = m(r.id) })
+        eachOf(d.attrs, function (a) { a.id = m(a.id) })
+        eachOf(d.texts, function (t) { t.id = m(t.id) })
+        break
+      case 'shadow':
+        d.hostId = m(d.hostId)
+        remapNode(state, d.node)
+        break
+      case 'iframe':
+        d.id = m(d.id)
+        remapNode(state, d.node)
+        break
+      case 'adopted':
+        d.id = m(d.id)
+        eachOf(d.sheets, function (r) { r.id = remapSheet(state, r.id) })
+        break
+      case 'style':
+        if (d.sheetId != null) d.sheetId = remapSheet(state, d.sheetId)
+        else d.id = m(d.id)
+        break
+      case 'click':
+        d.id = d.id == null ? null : m(d.id)
+        offsetFrom(state.el, d)
+        break
+      case 'mouse':
+        offsetFrom(state.el, d)
+        break
+      default: // canvas, media, input, scroll
+        d.id = m(d.id)
+    }
+    emit(ev.type, d)
+  }
+
+  // Inside a cross-origin iframe: stream DOM events to an allowed parent that asks for them.
+  function onParentMessage(e) {
+    if (!active || e.source !== window.parent || !e.data || e.data.__logit !== 'request') return
+    var allowed = config.parentOrigins
+    if (allowed.indexOf('*') === -1 && allowed.indexOf(e.origin) === -1) return
+    parentLink = e.origin
+    takeFullSnapshot()
+  }
+
+  function startFrameBridge() {
+    if (patched.frames) return
+    patched.frames = true
+    if (config.recordCrossOriginIframes) window.addEventListener('message', safe(onFrameMessage))
+    if (window.parent !== window && config.parentOrigins.length) {
+      window.addEventListener('message', safe(onParentMessage))
+      try { window.parent.postMessage({ __logit: 'hello' }, '*') } catch (e) { /* ignore */ }
     }
   }
 
@@ -824,6 +1102,11 @@
     if (!t || (t.tagName !== 'VIDEO' && t.tagName !== 'AUDIO')) return
     var id = nodeIds.get(t)
     if (!id || isInsideBlocked(t)) return
+    if (pendingManifests.length && !mediaStreams.has(t) && isMse(t)) {
+      // The first manifest is the master playlist; later ones are its variants.
+      assignStream(t, pendingManifests[0])
+      pendingManifests = []
+    }
     var state = mediaState(t)
     state.id = id
     state.action = e.type
@@ -840,6 +1123,7 @@
     if (t.tagName === 'IFRAME' || t.tagName === 'FRAME') {
       var doc = config.recordIframes && frameDoc(t)
       if (doc) emit('iframe', { id: id, node: serializeNode(doc) })
+      else if (config.recordIframes && isCrossOriginFrame(t)) onRemoteFrameLoad(t, id)
     } else if (t.tagName === 'LINK' && config.inlineStylesheets && STYLESHEET_RE.test(t.rel || '')) {
       var css = sheetText(t.sheet)
       if (css != null) emit('style', { id: id, css: css })
@@ -1025,6 +1309,8 @@
   }
 
   function emitNetwork(entry) {
+    var type = entry.responseHeaders && entry.responseHeaders['content-type']
+    if (MANIFEST_RE.test(entry.url) || MANIFEST_TYPE_RE.test(type || '')) noteManifest(entry.url)
     entry.slow = entry.duration >= config.slowRequestThreshold
     emit('network', entry, entry.start)
   }
@@ -1279,6 +1565,9 @@
       if (res.status === 429 || res.status >= 500) throw new Error('HTTP ' + res.status)
       if (!res.ok) debug('batch rejected with status', res.status) // 4xx: retrying would not help
       failures = 0
+      if (res.ok && config.uploadAssets) {
+        return res.json().then(function (body) { return uploadMissingAssets(body && body.missing) }, function () {})
+      }
     }).catch(function (err) {
       failures++
       backoffUntil = now() + Math.min(60000, 1000 * Math.pow(2, failures))
@@ -1294,6 +1583,33 @@
       if (buffer.length >= config.maxBatchSize) scheduleFlush(0)
     })
     return inflight
+  }
+
+  // The server reports assets it could not fetch itself (typically behind a login); the browser can.
+  function uploadMissingAssets(urls) {
+    if (!config.uploadAssets || !Array.isArray(urls) || !urls.length || !nativeFetch) return
+    var endpoint = new URL('assets', config.endpoint).href +
+      '?appId=' + encodeURIComponent(config.appId) + '&sessionId=' + encodeURIComponent(sessionState.id) + '&url='
+    return Promise.all(urls.slice(0, 20).map(function (url) {
+      if (typeof url !== 'string' || !/^https?:/i.test(url) || uploadedAssets.has(url)) return
+      uploadedAssets.add(url)
+      var origin
+      try { origin = new URL(url).origin } catch (e) { return }
+      var withCookies = origin === location.origin || config.assetCredentialOrigins.indexOf(origin) !== -1
+      return nativeFetch(url, { credentials: withCookies ? 'include' : 'omit', cache: 'force-cache' }).then(function (res) {
+        if (!res.ok) return
+        var type = (res.headers.get('content-type') || '').split(';')[0].trim()
+        return res.blob().then(function (blob) {
+          if (!blob.size || blob.size > config.assetUploadMaxBytes) return
+          return nativeFetch(endpoint + encodeURIComponent(url), {
+            method: 'POST',
+            body: blob,
+            headers: { 'Content-Type': type || 'application/octet-stream' },
+            credentials: 'omit'
+          })
+        })
+      }).catch(function (err) { debug('asset upload failed', url, err) })
+    }))
   }
 
   // Resolves once everything buffered has been sent (or sending is backing off).
@@ -1326,6 +1642,7 @@
     emit('meta', collectMeta())
     if (identity) emit('identify', identity)
     addRootListeners(document)
+    startFrameBridge()
     if (config.recordInteractions) window.addEventListener('resize', safe(onResize), { passive: true })
     if (config.recordDom) startDomRecording()
     if (config.recordConsole) patchConsole()
@@ -1364,6 +1681,12 @@
     emit('identify', identity)
   }
 
+  // For pages with several MSE players: say which manifest feeds which <video>.
+  function setMediaSource(el, url) {
+    if (!active || !el || el.nodeType !== 1 || !url) return
+    assignStream(el, absUrl(String(url)))
+  }
+
   function stop() {
     if (!active) return
     flushOnUnload()
@@ -1391,6 +1714,7 @@
     flush: function () { try { return flushAll() } catch (e) { return Promise.resolve() } },
     stop: safe(stop),
     takeSnapshot: safe(takeFullSnapshot),
+    setMediaSource: safe(setMediaSource),
     getSessionId: function () { return sessionState && active ? sessionState.id : null },
     getSessionURL: safe(getSessionURL),
     getEvents: function () { return buffer.slice() },
@@ -1403,6 +1727,9 @@
 
   // Zero-config install: <script src=".../sdk/logit.js" data-app-id="my-app"></script>
   var script = document.currentScript
+  function listAttr(name) {
+    return (script.getAttribute(name) || '').split(',').map(function (s) { return s.trim() }).filter(Boolean)
+  }
   if (script && script.getAttribute('data-app-id')) {
     var endpoint = script.getAttribute('data-endpoint')
     if (!endpoint && script.src) endpoint = new URL('/api/ingest', script.src).href
@@ -1411,6 +1738,9 @@
       endpoint: endpoint,
       maskAllInputs: script.hasAttribute('data-mask-all-inputs'),
       recordCanvas: script.hasAttribute('data-record-canvas'),
+      uploadAssets: script.hasAttribute('data-upload-assets'),
+      parentOrigins: listAttr('data-parent-origins'),
+      assetCredentialOrigins: listAttr('data-asset-credential-origins'),
       debug: script.hasAttribute('data-debug')
     })
   }

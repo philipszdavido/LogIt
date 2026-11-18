@@ -231,12 +231,22 @@
       `${meta.eventCount} events`
     ].join(' · ')
 
-    // Archived copies of the page's images, fonts and stylesheets, keyed by original URL.
+    // Archived copies of the page's images, fonts, stylesheets and media, keyed by original URL.
+    // 'frame:<url>' entries are archived HTML of cross-origin iframes, which the replayer needs up front.
     const assets = data.assets || {}
+    const frames = {}
+    await Promise.all(Object.keys(assets).filter(k => k.startsWith('frame:')).map(async key => {
+      try {
+        const res = await fetch('/assets/' + assets[key])
+        if (res.ok) frames[key.slice(6)] = await res.text()
+      } catch (e) { /* the frame stays empty */ }
+    }))
+    if (!state.current || state.current.sessionId !== sessionId) return // user moved on
     const replayer = new LogItReplayer($('stage'), data.events, {
       speed: Number($('speed').value),
       skipInactive: $('skip').checked,
-      resolveUrl: url => (Object.prototype.hasOwnProperty.call(assets, url) ? '/assets/' + assets[url] : null)
+      resolveUrl: url => (Object.prototype.hasOwnProperty.call(assets, url) ? '/assets/' + assets[url] : null),
+      frames
     })
     state.replayer = replayer
     replayer.on('time', onTime)

@@ -14,6 +14,7 @@ const { startPostgres } = require('./helpers/postgres')
 
 const HASH_A = 'a'.repeat(64)
 const HASH_B = 'b'.repeat(64)
+const HASH_C = 'c'.repeat(64)
 
 function batch(sessionId, events, extra = {}) {
   return Object.assign({ appId: 'shop', sessionId, pageId: 'p1', seq: 0, events }, extra)
@@ -98,7 +99,7 @@ function contract(name, makeStore) {
       const asset = await store.getAsset(HASH_A)
       assert.equal(asset.contentType, 'image/png')
       assert.equal(asset.body.toString(), 'png-bytes')
-      assert.equal(await store.getAsset('c'.repeat(64)), null)
+      assert.equal(await store.getAsset('d'.repeat(64)), null)
 
       await store.addSessionAssets('shop', 's1', { 'https://shop.test/a.png': HASH_A })
       await store.addSessionAssets('shop', 's1', { 'https://shop.test/b.css': HASH_B })
@@ -109,6 +110,30 @@ function contract(name, makeStore) {
       await store.addSessionAssets('shop', 'deleted-or-missing', { 'https://x/': HASH_A }) // must not throw
     })
 
+    test('stores large assets from files and streams byte ranges', async () => {
+      const file = path.join(os.tmpdir(), `logit-store-big-${process.pid}-${name}`)
+      fs.writeFileSync(file, '0123456789abcdef')
+      try {
+        await store.putAssetFile(HASH_C, 'video/mp4', file)
+        await store.putAssetFile(HASH_C, 'video/mp4', file) // idempotent
+      } finally {
+        fs.rmSync(file, { force: true })
+      }
+      const read = async (hash, start, end) => {
+        let out = ''
+        for await (const chunk of store.readAsset(hash, start, end)) out += chunk
+        return out
+      }
+      assert.deepEqual(await store.getAssetInfo(HASH_C), { contentType: 'video/mp4', size: 16 })
+      assert.equal(await read(HASH_C, 0, 15), '0123456789abcdef')
+      assert.equal(await read(HASH_C, 3, 9), '3456789')          // spans storage chunks
+      assert.equal(await read(HASH_C, 15, 15), 'f')
+      assert.equal((await store.getAsset(HASH_C)).body.toString(), '0123456789abcdef')
+      assert.equal(await read(HASH_A, 1, 3), 'ng-')              // assets stored in one piece too
+      assert.deepEqual(await store.getAssetInfo(HASH_A), { contentType: 'image/png', size: 9 })
+      assert.equal(await store.getAssetInfo('d'.repeat(64)), null)
+    })
+
     test('deletes sessions with their data, and garbage-collects assets', async () => {
       assert.equal(await store.delete('shop', 's1'), true)
       assert.equal(await store.delete('shop', 's1'), false)
@@ -117,8 +142,9 @@ function contract(name, makeStore) {
       assert.deepEqual(await store.getSessionAssets('shop', 's1'), {})
 
       await store.addSessionAssets('shop', 's2', { 'https://shop.test/b.css': HASH_B })
-      assert.equal(await store.gcAssets(0), 1) // A is no longer referenced, B still is
+      assert.equal(await store.gcAssets(0), 2) // A and C are no longer referenced, B still is
       assert.equal(await store.hasAsset(HASH_A), false)
+      assert.equal(await store.hasAsset(HASH_C), false)
       assert.equal(await store.hasAsset(HASH_B), true)
     })
 
@@ -149,7 +175,7 @@ describe('PgStore', async () => {
   }
   const { PgStore } = require('../server/pg-store')
 
-  contract('contract', async () => new PgStore(pg.url))
+  contract('contract', async () => new PgStore(pg.url, { chunkBytes: 4 })) // tiny chunks exercise range reads
 
   test('two instances share one database without losing writes', async () => {
     const a = new PgStore(pg.url)

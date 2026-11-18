@@ -180,6 +180,32 @@ class FileStore {
     await writeAtomic(file, body)
   }
 
+  /** Stores an asset from a file (large media is never held in memory). */
+  async putAssetFile(hash, contentType, source) {
+    const file = this._assetPath(hash)
+    await fsp.mkdir(path.dirname(file), { recursive: true })
+    await writeAtomic(file + '.type', contentType)
+    const tmp = `${file}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
+    await fsp.copyFile(source, tmp)
+    await fsp.rename(tmp, file)
+  }
+
+  async getAssetInfo(hash) {
+    const file = this._assetPath(hash)
+    try {
+      const [stat, contentType] = await Promise.all([fsp.stat(file), fsp.readFile(file + '.type', 'utf8')])
+      return { contentType, size: stat.size }
+    } catch (e) {
+      if (e.code === 'ENOENT') return null
+      throw e
+    }
+  }
+
+  /** Readable stream of bytes start..end (inclusive). */
+  readAsset(hash, start, end) {
+    return fs.createReadStream(this._assetPath(hash), { start, end })
+  }
+
   async getAsset(hash) {
     const file = this._assetPath(hash)
     try {

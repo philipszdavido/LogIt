@@ -5,7 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>LogIt Demo Shop</title>
   <!-- One-line install: records into app "demo" and sends to this server's /api/ingest -->
-  <script src="/sdk/logit.js" data-app-id="demo" data-record-canvas></script>
+  <script src="/sdk/logit.js" data-app-id="demo" data-record-canvas data-upload-assets></script>
+  <!-- Pretend the user is logged in: private/avatar.svg is only served with this cookie. -->
+  <script>document.cookie = 'logit_demo_auth=1; path=/demo; SameSite=Lax'</script>
   <link rel="stylesheet" href="demo.css">
   <style>
     body { font: 15px/1.5 system-ui, sans-serif; margin: 0; background: #fafafa; color: #222; }
@@ -80,17 +82,25 @@
       <logit-counter id="counter"></logit-counter>
       <secret-field id="secret-field"></secret-field>
       <div class="hero">Linked stylesheet + archived image</div>
+      <p><img id="avatar" src="private/avatar.svg" width="48" height="48" alt="Avatar behind a login"> Image behind a login, uploaded by the SDK</p>
+      <button id="theme" class="secondary">adoptedStyleSheets.push(theme)</button>
     </section>
 
     <section>
       <h2>Same-origin iframe</h2>
       <iframe id="widget" src="frame.html" title="Embedded widget"></iframe>
+      <h2>Cross-origin iframe</h2>
+      <iframe id="remote" title="Cross-origin widget"></iframe>
+      <h2>Cross-origin iframe without LogIt</h2>
+      <iframe id="static" title="Third-party widget"></iframe>
     </section>
 
     <section>
       <h2>Canvas &amp; video</h2>
       <canvas id="canvas" width="200" height="100"></canvas>
       <video id="video" width="200" height="100" muted playsinline></video>
+      <audio id="audio" src="tone.wav" controls></audio>
+      <video id="hls" width="160" height="90" muted playsinline title="HLS stream played through MediaSource"></video>
       <div>
         <button id="canvas-toggle" class="secondary">Pause animation</button>
         <button id="video-toggle" class="secondary">Play video</button>
@@ -155,6 +165,41 @@
     $('nav-b').onclick = () => { history.pushState({}, '', '/demo/?page=cart'); renderRoute() }
     window.addEventListener('hashchange', renderRoute)
     renderRoute()
+
+    // Changing the page's adoptedStyleSheets in place, without assigning a new array.
+    $('theme').onclick = () => {
+      const theme = new CSSStyleSheet()
+      theme.replaceSync('.hero { border-left: 6px solid rgb(22, 163, 74); }')
+      document.adoptedStyleSheets.push(theme)
+    }
+
+    // The same page served from the other loopback host name is a different origin.
+    const otherHost = location.hostname === 'localhost' ? '127.0.0.1' : 'localhost'
+    $('remote').src = location.protocol + '//' + otherHost + ':' + location.port + '/demo/remote.html'
+    $('static').src = location.protocol + '//' + otherHost + ':' + location.port + '/demo/static-widget.html'
+
+    // A minimal HLS player on MediaSource, like hls.js: the <video> only ever sees a blob: URL.
+    async function playHls(video, url) {
+      const ms = new MediaSource()
+      video.src = URL.createObjectURL(ms)
+      await new Promise(resolve => ms.addEventListener('sourceopen', resolve, { once: true }))
+      const master = await (await fetch(url)).text()
+      const variant = new URL(master.split('\n').find(l => l && !l.startsWith('#')), new URL(url, location.href))
+      const codecs = (master.match(/CODECS="([^"]+)"/) || [])[1] || 'avc1.42c00a'
+      const playlist = await (await fetch(variant)).text()
+      const parts = [playlist.match(/#EXT-X-MAP:URI="([^"]+)"/)[1]]
+        .concat(playlist.split('\n').filter(l => l && !l.startsWith('#')))
+        .map(p => new URL(p, variant))
+      const buffer = ms.addSourceBuffer(`video/mp4; codecs="${codecs}"`)
+      for (const part of parts) {
+        buffer.appendBuffer(await (await fetch(part)).arrayBuffer())
+        await new Promise(resolve => buffer.addEventListener('updateend', resolve, { once: true }))
+      }
+      ms.endOfStream()
+    }
+    window.hlsReady = window.MediaSource
+      ? playHls($('hls'), 'stream/master.m3u8').then(() => true, err => { console.warn('HLS demo failed', err); return false })
+      : Promise.resolve(false)
 
     // Open shadow root styled through a constructable stylesheet shared by every instance.
     const counterSheet = new CSSStyleSheet()

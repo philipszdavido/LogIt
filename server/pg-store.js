@@ -1,6 +1,9 @@
 'use strict'
 
+const fs = require('fs')
+const fsp = fs.promises
 const zlib = require('zlib')
+const { Readable } = require('stream')
 const { promisify } = require('util')
 const { ID_RE, ASSET_ID_RE, newMeta, updateMeta } = require('./meta')
 
@@ -47,6 +50,16 @@ CREATE TABLE IF NOT EXISTS logit_assets (
   content_type text   NOT NULL,
   body         bytea  NOT NULL,
   created_at   bigint NOT NULL
+);
+
+-- Large assets (media) are stored in chunks instead of in body, so they can be written and served in pieces.
+ALTER TABLE logit_assets ALTER COLUMN body DROP NOT NULL;
+ALTER TABLE logit_assets ADD COLUMN IF NOT EXISTS size bigint;
+CREATE TABLE IF NOT EXISTS logit_asset_chunks (
+  hash text    NOT NULL REFERENCES logit_assets (hash) ON DELETE CASCADE,
+  pos  bigint  NOT NULL,
+  data bytea   NOT NULL,
+  PRIMARY KEY (hash, pos)
 );
 
 CREATE TABLE IF NOT EXISTS logit_session_assets (
@@ -115,8 +128,9 @@ function checkIds(appId, sessionId) {
  * Event batches are stored gzip-compressed; session summaries are merged atomically in SQL.
  */
 class PgStore {
-  constructor(connectionString, { poolSize } = {}) {
+  constructor(connectionString, { poolSize, chunkBytes = 1024 * 1024 } = {}) {
     const { Pool } = require('pg')
+    this.chunkBytes = chunkBytes
     this.pool = new Pool({ connectionString, max: poolSize || 10 })
     this.pool.on('error', () => {}) // idle client errors are retried on next checkout
   }
@@ -245,10 +259,76 @@ class PgStore {
       [hash, contentType, body, Date.now()])
   }
 
-  async getAsset(hash) {
+  async putAssetFile(hash, contentType, file) {
+    if (!ASSET_ID_RE.test(hash)) throw new Error('invalid asset id')
+    const { size } = await fsp.stat(file)
+    const client = await this.pool.connect()
+    try {
+      // One transaction: readers never see a partly written asset, and concurrent writers of the same
+      // hash wait on the primary key, then skip.
+      await client.query('BEGIN')
+      const { rowCount } = await client.query(
+        'INSERT INTO logit_assets (hash, content_type, body, size, created_at) VALUES ($1, $2, NULL, $3, $4) ON CONFLICT (hash) DO NOTHING',
+        [hash, contentType, size, Date.now()])
+      if (rowCount) {
+        let pos = 0
+        for await (const chunk of fs.createReadStream(file, { highWaterMark: this.chunkBytes })) {
+          await client.query('INSERT INTO logit_asset_chunks (hash, pos, data) VALUES ($1, $2, $3)', [hash, pos, chunk])
+          pos += chunk.length
+        }
+      }
+      await client.query('COMMIT')
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {})
+      throw e
+    } finally {
+      client.release()
+    }
+  }
+
+  async getAssetInfo(hash) {
     if (!ASSET_ID_RE.test(hash)) return null
-    const { rows } = await this.pool.query('SELECT content_type, body FROM logit_assets WHERE hash = $1', [hash])
-    return rows[0] ? { contentType: rows[0].content_type, body: rows[0].body } : null
+    const { rows } = await this.pool.query(
+      'SELECT content_type, COALESCE(size, octet_length(body)) AS size FROM logit_assets WHERE hash = $1', [hash])
+    return rows[0] ? { contentType: rows[0].content_type, size: Number(rows[0].size) } : null
+  }
+
+  /** Readable stream of bytes start..end (inclusive), fetched a few chunks at a time. */
+  readAsset(hash, start, end) {
+    return Readable.from(this._readRange(hash, start, end))
+  }
+
+  async * _readRange(hash, start, end) {
+    const { rows } = await this.pool.query(
+      'SELECT body IS NOT NULL AS inline, substring(body from $2::int for $3::int) AS part FROM logit_assets WHERE hash = $1',
+      [hash, start + 1, end - start + 1])
+    if (!rows[0]) return
+    if (rows[0].inline) {
+      yield rows[0].part
+      return
+    }
+    let from = start
+    while (from <= end) {
+      const { rows: chunks } = await this.pool.query(
+        `SELECT pos, data FROM logit_asset_chunks
+          WHERE hash = $1 AND pos + octet_length(data) > $2 AND pos <= $3 ORDER BY pos LIMIT 4`,
+        [hash, from, end])
+      if (!chunks.length) return
+      for (const c of chunks) {
+        const pos = Number(c.pos)
+        const stop = Math.min(c.data.length, end - pos + 1)
+        yield c.data.subarray(Math.max(0, from - pos), stop)
+        from = pos + stop
+      }
+    }
+  }
+
+  async getAsset(hash) {
+    const info = await this.getAssetInfo(hash)
+    if (!info) return null
+    const parts = []
+    if (info.size) for await (const part of this._readRange(hash, 0, info.size - 1)) parts.push(part)
+    return { contentType: info.contentType, body: Buffer.concat(parts) }
   }
 
   async addSessionAssets(appId, sessionId, map) {

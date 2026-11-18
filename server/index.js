@@ -4,11 +4,13 @@ const http = require('http')
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
+const { pipeline } = require('stream')
 const { createStore, ID_RE, ASSET_ID_RE } = require('./store')
 const { AssetArchiver } = require('./assets')
 
 const ROOT = path.resolve(__dirname, '..')
 const MAX_EVENTS_PER_BATCH = 5000
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -17,7 +19,12 @@ const CONTENT_TYPES = {
   '.json': 'application/json; charset=utf-8',
   '.svg': 'image/svg+xml',
   '.png': 'image/png',
-  '.ico': 'image/x-icon'
+  '.ico': 'image/x-icon',
+  '.wav': 'audio/wav',
+  '.mp4': 'video/mp4',
+  '.m4s': 'video/iso.segment',
+  '.m3u8': 'application/vnd.apple.mpegurl',
+  '.mpd': 'application/dash+xml'
 }
 
 // Archived assets are attacker-influenced content (e.g. SVG): never let them run script on our origin.
@@ -43,6 +50,23 @@ function list(value) {
   return String(value || '').split(',').map(s => s.trim()).filter(Boolean)
 }
 
+// LOGIT_ASSET_HEADERS='{"cdn.example.com": {"Authorization": "Bearer ..."}, "*.example.com": {...}}'
+function hostHeaders(value) {
+  if (!value) return {}
+  let parsed
+  try {
+    parsed = JSON.parse(value)
+  } catch (e) {
+    throw new Error('LOGIT_ASSET_HEADERS must be JSON: {"host": {"Header": "value"}}')
+  }
+  for (const [host, headers] of Object.entries(parsed)) {
+    if (!headers || typeof headers !== 'object' || Object.values(headers).some(v => typeof v !== 'string')) {
+      throw new Error(`LOGIT_ASSET_HEADERS: headers for ${host} must be an object of strings`)
+    }
+  }
+  return parsed
+}
+
 function configFromEnv(env = process.env) {
   const production = env.NODE_ENV === 'production'
   return {
@@ -54,6 +78,10 @@ function configFromEnv(env = process.env) {
     archiveAssets: env.LOGIT_ARCHIVE_ASSETS ? env.LOGIT_ARCHIVE_ASSETS === 'true' : true,
     assetAllowPrivate: env.LOGIT_ASSET_ALLOW_PRIVATE ? env.LOGIT_ASSET_ALLOW_PRIVATE === 'true' : !production,
     assetMaxBytes: Number(env.LOGIT_ASSET_MAX_BYTES || 5 * 1024 * 1024),
+    archiveMedia: env.LOGIT_ARCHIVE_MEDIA ? env.LOGIT_ARCHIVE_MEDIA === 'true' : true,
+    mediaMaxBytes: Number(env.LOGIT_MEDIA_MAX_BYTES || 200 * 1024 * 1024),
+    archiveFrames: env.LOGIT_ARCHIVE_FRAMES ? env.LOGIT_ARCHIVE_FRAMES === 'true' : true,
+    assetHeaders: hostHeaders(env.LOGIT_ASSET_HEADERS),
     assetHosts: list(env.LOGIT_ASSET_HOSTS),
     adminToken: env.LOGIT_ADMIN_TOKEN || '',
     allowedAppIds: list(env.LOGIT_ALLOWED_APP_IDS),
@@ -151,6 +179,10 @@ async function createApp(overrides = {}) {
     ? new AssetArchiver(store, {
       allowPrivate: config.assetAllowPrivate,
       maxBytes: config.assetMaxBytes,
+      archiveMedia: config.archiveMedia,
+      mediaMaxBytes: config.mediaMaxBytes,
+      archiveFrames: config.archiveFrames,
+      hostHeaders: config.assetHeaders || {},
       allowedHosts: config.assetHosts,
       log: config.log
     })
@@ -189,18 +221,25 @@ async function createApp(overrides = {}) {
     return true
   }
 
-  async function handleIngest(req, res) {
+  // Shared by the SDK endpoints: CORS allowlist, preflight, method and rate limit. Returns false if answered.
+  function sdkRequest(req, res) {
     const corsOk = applyIngestCors(req, res)
     if (req.method === 'OPTIONS') {
       res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
       res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
       res.setHeader('Access-Control-Max-Age', '86400')
       res.writeHead(corsOk ? 204 : 403)
-      return res.end()
+      res.end()
+      return false
     }
     if (req.method !== 'POST') throw new HttpError(405, 'Method not allowed')
     if (!corsOk) throw new HttpError(403, 'Origin not allowed')
     if (!limiter.allow(clientIp(req))) throw new HttpError(429, 'Too many requests')
+    return true
+  }
+
+  async function handleIngest(req, res) {
+    if (!sdkRequest(req, res)) return
 
     const raw = await readBody(req, config.maxBodyBytes)
     let batch
@@ -219,7 +258,31 @@ async function createApp(overrides = {}) {
         config.log('asset extraction failed', err.message)
       }
     }
-    sendJson(res, 202, { ok: true })
+    const missing = archiver ? archiver.takeMissing(batch.appId, batch.sessionId) : []
+    sendJson(res, 202, missing.length ? { ok: true, missing } : { ok: true })
+  }
+
+  // POST /api/assets?appId=&sessionId=&url= with the asset as the body: an asset the server could not
+  // fetch itself, uploaded by the SDK from the user's browser.
+  async function handleAssetUpload(req, res, url) {
+    if (!sdkRequest(req, res)) return
+    if (!archiver) throw new HttpError(404, 'Asset archiving is disabled')
+    const p = url.searchParams
+    const appId = p.get('appId') || ''
+    const sessionId = p.get('sessionId') || ''
+    const assetUrl = p.get('url') || ''
+    if (!ID_RE.test(appId) || !ID_RE.test(sessionId)) throw new HttpError(400, 'invalid id')
+    if (config.allowedAppIds.length && !config.allowedAppIds.includes(appId)) throw new HttpError(400, 'unknown appId')
+    if (assetUrl.length > 2048 || !/^https?:\/\//i.test(assetUrl)) throw new HttpError(400, 'invalid url')
+    if (!(await store.getMeta(appId, sessionId))) throw new HttpError(404, 'Session not found')
+    const body = await readBody(req, Math.max(config.assetMaxBytes, config.archiveMedia ? Math.min(config.mediaMaxBytes, MAX_UPLOAD_BYTES) : 0))
+    try {
+      const hash = await archiver.storeUpload(appId, sessionId, assetUrl, req.headers['content-type'], body)
+      sendJson(res, 201, { hash })
+    } catch (err) {
+      if (err.status) throw new HttpError(err.status, err.message)
+      throw err
+    }
   }
 
   async function handleApi(req, res, url) {
@@ -271,17 +334,42 @@ async function createApp(overrides = {}) {
   async function serveAsset(req, res, hash) {
     if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'Method not allowed')
     if (!ASSET_ID_RE.test(hash)) throw new HttpError(404, 'Not found')
-    const asset = await store.getAsset(hash)
+    const asset = await store.getAssetInfo(hash)
     if (!asset) throw new HttpError(404, 'Not found')
-    res.writeHead(200, {
-      'Content-Type': asset.contentType,
-      'Content-Length': asset.body.length,
+    const total = asset.size
+    const headers = {
+      // Archived iframe documents are data for the replayer, never a page to render on our origin.
+      'Content-Type': /^text\/html/.test(asset.contentType) ? 'text/plain; charset=utf-8' : asset.contentType,
+      'Content-Length': total,
+      'Accept-Ranges': 'bytes',
       'Cache-Control': 'public, max-age=31536000, immutable',
       'Content-Security-Policy': ASSET_CSP,
       'Access-Control-Allow-Origin': '*',
       'Cross-Origin-Resource-Policy': 'cross-origin'
+    }
+    // Media elements need byte ranges to seek.
+    let start = 0
+    let end = total - 1
+    let status = 200
+    const range = /^bytes=(\d*)-(\d*)$/.exec(String(req.headers.range || '').trim())
+    if (range && (range[1] || range[2])) {
+      start = range[1] ? Number(range[1]) : Math.max(0, total - Number(range[2]))
+      end = range[1] && range[2] ? Math.min(Number(range[2]), total - 1) : total - 1
+      if (!range[1] && !Number(range[2])) start = total // "bytes=-0" is unsatisfiable
+      if (start > end || start >= total) {
+        res.writeHead(416, { 'Content-Range': `bytes */${total}` })
+        return res.end()
+      }
+      status = 206
+      headers['Content-Range'] = `bytes ${start}-${end}/${total}`
+      headers['Content-Length'] = end - start + 1
+    }
+    res.writeHead(status, headers)
+    if (req.method === 'HEAD' || !total) return res.end()
+    // Streamed, so large media is never loaded into memory.
+    pipeline(store.readAsset(hash, start, end), res, e => {
+      if (e && e.code !== 'ERR_STREAM_PREMATURE_CLOSE') config.log('asset stream failed', hash, e.message)
     })
-    res.end(req.method === 'HEAD' ? undefined : asset.body)
   }
 
   function serveStatic(req, res, url) {
@@ -323,13 +411,14 @@ async function createApp(overrides = {}) {
     res.setHeader('Referrer-Policy', 'no-referrer')
     let url
     res.on('finish', () => {
-      if (url && url.pathname !== '/api/ingest' && url.pathname !== '/healthz') {
+      if (url && url.pathname !== '/api/ingest' && url.pathname !== '/api/assets' && url.pathname !== '/healthz') {
         config.log(req.method, req.url, res.statusCode, Date.now() - started + 'ms')
       }
     })
     try {
       url = new URL(req.url, 'http://localhost')
       if (url.pathname === '/api/ingest') await handleIngest(req, res)
+      else if (url.pathname === '/api/assets') await handleAssetUpload(req, res, url)
       else if (url.pathname.startsWith('/api/')) await handleApi(req, res, url)
       else if (url.pathname.startsWith('/assets/')) await serveAsset(req, res, url.pathname.slice('/assets/'.length))
       else if (url.pathname === '/healthz') {
@@ -345,6 +434,11 @@ async function createApp(overrides = {}) {
       } else if (config.serveDemo && url.pathname === '/demo/api/slow') {
         const ms = Math.min(Number(url.searchParams.get('ms')) || 1500, 10000)
         setTimeout(() => sendJson(res, 200, { ok: true, delayedMs: ms }), ms)
+      } else if (config.serveDemo && url.pathname === '/demo/private/avatar.svg') {
+        // Stands in for an asset behind a login: only the browser (with the cookie) can fetch it.
+        if (!/(^|;\s*)logit_demo_auth=1(;|$)/.test(String(req.headers.cookie || ''))) throw new HttpError(401, 'Login required')
+        res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Cache-Control': 'private, no-cache' })
+        res.end('<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><circle cx="24" cy="24" r="22" fill="#7c3aed"/></svg>')
       } else if (config.serveDemo && url.pathname === '/demo') {
         res.writeHead(302, { Location: '/demo/' })
         res.end()
@@ -395,7 +489,7 @@ async function createApp(overrides = {}) {
       const closed = new Promise(resolve => server.close(resolve))
       if (server.closeIdleConnections) server.closeIdleConnections()
       await closed
-      if (archiver) await archiver.drain()
+      if (archiver) await archiver.close()
       await store.drain()
       await store.close()
     }

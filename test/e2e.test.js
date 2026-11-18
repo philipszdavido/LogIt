@@ -18,6 +18,7 @@ let browser
 let dataDir
 let sessionId
 let session
+let remote
 
 before(async () => {
   if (!chromePath) return
@@ -85,6 +86,27 @@ test('records a session on the demo page', { skip: !chromePath && 'Chrome not fo
   await browser.evaluate("document.getElementById('widget').contentDocument.getElementById('frame-input').focus()")
   await browser.type('typed in iframe')
 
+  // Cross-origin iframe (localhost vs 127.0.0.1): page JS can't reach in, so use real input events.
+  await browser.waitFor("performance.getEntriesByType('resource').some(e => e.initiatorType === 'iframe' && e.name.includes('remote.html'))")
+  await browser.evaluate('new Promise(r => setTimeout(r, 500))') // handshake + the frame's snapshot
+  remote = await browser.evaluate(`(() => {
+    const f = document.getElementById('remote')
+    f.scrollIntoView({ block: 'center' })
+    const r = f.getBoundingClientRect()
+    return { x: r.x + f.clientLeft, y: r.y + f.clientTop }
+  })()`)
+  await browser.evaluate('new Promise(r => setTimeout(r, 200))')
+  await browser.click(remote.x + 20, remote.y + 20) // #remote-add
+  await browser.click(remote.x + 20, remote.y + 55) // #remote-input
+  await browser.type('cross-origin text')
+
+  // A cross-origin iframe without LogIt, and an HLS stream played through MediaSource.
+  await browser.waitFor("performance.getEntriesByType('resource').some(e => e.initiatorType === 'iframe' && e.name.includes('static-widget.html'))")
+  assert.equal(await browser.evaluate('window.hlsReady'), true, 'demo HLS player ran')
+
+  // adoptedStyleSheets changed in place.
+  await browser.evaluate("document.getElementById('theme').click()")
+
   // Media + canvas: play the stream-backed video and let a few canvas frames be sampled.
   await browser.evaluate("document.getElementById('video-toggle').click()")
   await browser.evaluate('new Promise(r => setTimeout(r, 1200))')
@@ -141,16 +163,45 @@ test('captured shadow DOM, iframes, canvas, media and stylesheets', { skip: !chr
   assert.ok(ofType('canvas').length >= 1, 'canvas frames')
   assert.ok(ofType('canvas').every(e => e.data.data.startsWith('data:image/')), 'frames are images')
   assert.ok(ofType('media').some(e => e.data.action === 'play'), 'media play event')
+  assert.ok(ofType('iframe').some(e => e.data.node && JSON.stringify(e.data.node).includes('remote-list')), 'cross-origin iframe snapshot')
+  assert.ok(ofType('input').some(e => e.data.value === 'cross-origin text'), 'input inside cross-origin iframe')
+  const remoteClick = ofType('click').find(e => e.data.selector === 'button#remote-add')
+  assert.ok(remoteClick && Math.abs(remoteClick.data.x - (remote.x + 20)) <= 2, 'click position mapped to the top page')
+  assert.ok(ofType('iframe').some(e => (e.data.url || '').endsWith('/demo/static-widget.html')), 'iframe without LogIt recorded by URL')
+  assert.ok(ofType('stream').some(e => e.data.url === app.url + '/demo/stream/master.m3u8'), 'HLS manifest matched to its <video>')
+  assert.ok(ofType('adopted').some(e => e.data.id === 1 && e.data.sheets.some(s => (s.css || '').includes('rgb(22, 163, 74)'))), 'in-place adoptedStyleSheets change')
 })
 
 test('archived the page assets on the server', { skip: !chromePath && 'Chrome not found' }, async () => {
   await app.archiver.drain()
+  // The server reports the login-protected avatar as missing in an ingest response; the SDK uploads it.
+  await browser.evaluate("LogIt.track('poke'); LogIt.flush()")
   const res = await fetch(`${app.url}/api/sessions/demo/${sessionId}`, { headers: { Authorization: 'Bearer ' + TOKEN } })
   const { assets } = await res.json()
   const hash = assets[app.url + '/demo/pattern.svg']
   assert.match(hash || '', /^[a-f0-9]{64}$/)
   const asset = await fetch(app.url + '/assets/' + hash)
   assert.equal(asset.headers.get('content-type'), 'image/svg+xml')
+
+  const avatar = await fetch(app.url + '/assets/' + assets[app.url + '/demo/private/avatar.svg'])
+  assert.equal(avatar.status, 200, 'asset behind a login uploaded by the SDK')
+  assert.match(await avatar.text(), /#7c3aed/)
+
+  // The HLS stream, flattened into one fragmented MP4: init segment + media segments.
+  const stream = await fetch(app.url + '/assets/' + assets[app.url + '/demo/stream/master.m3u8'])
+  assert.equal(stream.headers.get('content-type'), 'video/mp4')
+  const expected = Buffer.concat(['init.mp4', 'seg0.m4s', 'seg1.m4s'].map(f => fs.readFileSync(path.join(__dirname, '..', 'demo', 'stream', f))))
+  assert.ok(Buffer.from(await stream.arrayBuffer()).equals(expected), 'flattened stream')
+
+  // The third-party iframe's HTML, plus the image it uses.
+  const staticUrl = app.url.replace('127.0.0.1', 'localhost') + '/demo/static-widget.html'
+  assert.match(assets['frame:' + staticUrl] || '', /^[a-f0-9]{64}$/, 'iframe HTML archived')
+  assert.match(assets[app.url.replace('127.0.0.1', 'localhost') + '/demo/pattern.svg'] || '', /^[a-f0-9]{64}$/, 'iframe image archived')
+
+  const audio = await fetch(app.url + '/assets/' + assets[app.url + '/demo/tone.wav'], { headers: { Range: 'bytes=0-3' } })
+  assert.equal(audio.status, 206, 'audio archived and served with ranges')
+  assert.equal(audio.headers.get('content-type'), 'audio/wav')
+  assert.equal(await audio.text(), 'RIFF')
 })
 
 test('masks and blocks sensitive content', { skip: !chromePath && 'Chrome not found' }, () => {
@@ -207,7 +258,16 @@ test('replays the session in the viewer', { skip: !chromePath && 'Chrome not fou
       frameInput: frameDoc.getElementById('frame-input').value,
       poster: (doc.getElementById('video').getAttribute('poster') || '').slice(0, 11),
       heroBackground: doc.defaultView.getComputedStyle(doc.querySelector('.hero')).backgroundImage,
-      linkedStylesheets: doc.querySelectorAll('link[rel=stylesheet]').length
+      linkedStylesheets: doc.querySelectorAll('link[rel=stylesheet]').length,
+      themeBorder: doc.defaultView.getComputedStyle(doc.querySelector('.hero')).borderLeftColor,
+      remoteRows: [...doc.getElementById('remote').contentDocument.querySelectorAll('#remote-list li')].map(li => li.textContent),
+      remoteInput: doc.getElementById('remote').contentDocument.getElementById('remote-input').value,
+      avatar: doc.getElementById('avatar').getAttribute('src'),
+      staticTitle: doc.getElementById('static').contentDocument.getElementById('static-title').textContent,
+      staticImg: doc.getElementById('static').contentDocument.getElementById('static-img').getAttribute('src'),
+      staticScripts: doc.getElementById('static').contentDocument.scripts.length,
+      hls: doc.getElementById('hls').getAttribute('src'),
+      audio: doc.getElementById('audio').getAttribute('src')
     }
   })()`)
   assert.equal(rich.count, '2')
@@ -218,6 +278,17 @@ test('replays the session in the viewer', { skip: !chromePath && 'Chrome not fou
   assert.equal(rich.poster, 'data:image/')
   assert.equal(rich.linkedStylesheets, 0)
   assert.match(rich.heroBackground, /\/assets\/[a-f0-9]{64}/)
+  assert.equal(rich.themeBorder, 'rgb(22, 163, 74)')
+  assert.deepEqual(rich.remoteRows, ['Remote row 1'])
+  assert.equal(rich.remoteInput, 'cross-origin text')
+  assert.match(rich.avatar, /^\/assets\/[a-f0-9]{64}$/)
+  assert.match(rich.audio, /^\/assets\/[a-f0-9]{64}$/)
+  assert.equal(rich.staticTitle, 'Third-party widget (no LogIt)')
+  assert.match(rich.staticImg, /^\/assets\/[a-f0-9]{64}$/)
+  assert.equal(rich.staticScripts, 0)
+  assert.match(rich.hls, /^\/assets\/[a-f0-9]{64}$/)
+  // The flattened stream really decodes in the replay.
+  await browser.waitFor("window.logitViewer.replayer.getDocument().getElementById('hls').readyState >= 1", 5000)
 
   // Canvas frames are decoded asynchronously.
   await browser.waitFor(`(() => {

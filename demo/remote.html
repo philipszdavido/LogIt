@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Cross-origin widget</title>
+  <!-- data-parent-origins lists the pages allowed to receive this frame's DOM. '*' is only for the demo,
+       whose parent origin changes; list real origins in production. -->
+  <script src="/sdk/logit.js" data-app-id="demo-widget" data-parent-origins="*"></script>
+  <style>
+    body { font: 14px system-ui, sans-serif; margin: 0; }
+    button, input { display: block; width: 100%; box-sizing: border-box; margin: 0; border: 0; font: inherit; }
+    button { height: 40px; background: #b45309; color: #fff; }
+    input { height: 30px; padding: 0 8px; border-bottom: 1px solid #ddd; }
+  </style>
+</head>
+<body>
+  <button id="remote-add">Add row (cross-origin)</button>
+  <input id="remote-input" placeholder="Type inside the cross-origin iframe">
+  <ol id="remote-list"></ol>
+  <script>
+    document.getElementById('remote-add').onclick = () => {
+      const li = document.createElement('li')
+      li.textContent = 'Remote row ' + (document.querySelectorAll('#remote-list li').length + 1)
+      document.getElementById('remote-list').appendChild(li)
+    }
+  </script>
+</body>
+</html>

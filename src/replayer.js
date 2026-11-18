@@ -5,7 +5,8 @@
  *   const player = new LogItReplayer(containerEl, events, {
  *     speed: 1,
  *     skipInactive: true,
- *     resolveUrl: url => archivedUrlFor(url) || url   // optional: serve archived assets
+ *     resolveUrl: url => archivedUrlFor(url) || url,  // optional: serve archived assets
+ *     frames: { 'https://other.site/widget': '<html>…' }  // optional: archived HTML of cross-origin iframes
  *   })
  *   player.on('time', ms => ...); player.play(); player.seek(ms); player.setSpeed(2)
  */
@@ -15,13 +16,15 @@
   var SVG_NS = 'http://www.w3.org/2000/svg'
   var EMBED_TAGS = { iframe: 1, frame: 1, object: 1, embed: 1 }
   var URL_ATTRS = { href: 1, src: 1, poster: 1, background: 1, 'xlink:href': 1 }
+  var ABS_URL_ATTRS = { href: 1, src: 1, poster: 1, background: 1, 'xlink:href': 1, action: 1, cite: 1, data: 1 }
   var CSS_URL_RE = /url\(\s*(['"]?)([^'")]+)\1\s*\)/gi
   var CURSOR_SVG = '<svg width="20" height="20" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg">' +
     '<path d="M2 1l14 8.5-6.2 1.3L13 18l-2.6 1.1-3.2-7.1L2 16z" fill="#111" stroke="#fff" stroke-width="1.2"/></svg>'
 
   function LogItReplayer(container, events, options) {
     this.container = container
-    this.options = Object.assign({ speed: 1, skipInactive: true, inactiveThreshold: 4000, resolveUrl: null }, options)
+    this.options = Object.assign({ speed: 1, skipInactive: true, inactiveThreshold: 4000, resolveUrl: null, frames: null }, options)
+    this._staticFrames = new Map()  // frame URL -> snapshot built from its archived HTML
     // Network events are stamped with their start time, so order by time, keeping arrival order for ties.
     this.events = (events || []).map(function (e, i) { return { e: e, i: i } })
       .sort(function (a, b) { return a.e.t - b.e.t || a.i - b.i })
@@ -234,6 +237,8 @@
     if (sn.cssText != null) el.textContent = this._css(sn.cssText)
     if (sn.value != null) { try { el.value = sn.value } catch (e) { /* ignore */ } }
     if (sn.doc) this._pendingFrames.push({ el: el, doc: sn.doc })
+    else if (sn.remote && attrs.src) this._queueStaticFrame(el, attrs.src)
+    if (sn.stream) this._setStream(el, sn.stream)
     if (sn.canvas) this._drawFrame(el, sn.canvas)
     if (sn.media) this._setMedia(el, sn.media, null)
     return el
@@ -279,6 +284,7 @@
     if (tag === 'meta' && name === 'http-equiv') return
     if (tag === 'base' && name === 'href') return
     if (el.tagName === 'STYLE' && tag === 'link') return // inlined stylesheet: only CSS updates matter
+    if (name === 'src' && el.__logitStream) return // plays the archived stream instead of a dead blob: URL
     if (value !== null) {
       if (URL_ATTRS[name]) value = this._url(value)
       else if (name === 'srcset') value = this._srcset(value)
@@ -288,6 +294,73 @@
       if (value === null) el.removeAttribute(name)
       else el.setAttribute(name, value)
     } catch (e) { /* invalid attribute name */ }
+  }
+
+  // ---------------------------------------------------------------- cross-origin frames without LogIt
+
+  function absUrl(url, base) {
+    var s = String(url).trim()
+    if (!s || /^(data:|blob:|#|mailto:|tel:|about:)/i.test(s)) return s
+    if (/^javascript:/i.test(s)) return 'javascript:void(0)'
+    try { return new URL(s, base).href } catch (e) { return s }
+  }
+
+  function absCss(css, base) {
+    return css.indexOf('url(') === -1 ? css : css.replace(CSS_URL_RE, function (m, q, u) { return 'url(' + q + absUrl(u, base) + q + ')' })
+  }
+
+  // Converts a parsed (inert) document into the recorder's snapshot format, with URLs made absolute.
+  function toSnapshot(node, base, parentTag, counter) {
+    var id = 'static:' + (++counter.n)
+    var i
+    switch (node.nodeType) {
+      case 9: {
+        var root = { id: id, type: 9, childNodes: [] }
+        for (i = 0; i < node.childNodes.length; i++) root.childNodes.push(toSnapshot(node.childNodes[i], base, null, counter))
+        return root
+      }
+      case 10: return { id: id, type: 10, name: node.name, publicId: node.publicId, systemId: node.systemId }
+      case 3: return { id: id, type: 3, text: parentTag === 'script' ? '' : parentTag === 'style' ? absCss(node.nodeValue, base) : node.nodeValue }
+      case 1: {
+        var tag = node.localName
+        var sn = { id: id, type: 1, tag: tag, attrs: {}, childNodes: [] }
+        if (node.namespaceURI === SVG_NS) sn.svg = 1
+        for (i = 0; i < node.attributes.length; i++) {
+          var a = node.attributes[i]
+          var v = a.value
+          if (/^on/i.test(a.name)) continue
+          if (ABS_URL_ATTRS[a.name]) v = absUrl(v, base)
+          else if (a.name === 'srcset') v = v.split(',').map(function (p) { var b = p.trim().split(/\s+/); b[0] = absUrl(b[0], base); return b.join(' ') }).join(', ')
+          else if (a.name === 'style') v = absCss(v, base)
+          sn.attrs[a.name] = v
+        }
+        for (i = 0; i < node.childNodes.length; i++) sn.childNodes.push(toSnapshot(node.childNodes[i], base, tag, counter))
+        return sn
+      }
+      default: return { id: id, type: 8, text: '' }
+    }
+  }
+
+  // The server archives the HTML of cross-origin frames it could fetch; it is parsed without running anything.
+  LogItReplayer.prototype._staticFrame = function (url) {
+    if (this._staticFrames.has(url)) return this._staticFrames.get(url)
+    var frames = this.options.frames
+    var html = frames && Object.prototype.hasOwnProperty.call(frames, url) ? frames[url] : null
+    var snap = null
+    if (typeof html === 'string' && typeof DOMParser !== 'undefined') {
+      var doc = new DOMParser().parseFromString(html, 'text/html')
+      var base = url
+      var baseEl = doc.querySelector('base[href]')
+      if (baseEl) base = absUrl(baseEl.getAttribute('href'), url)
+      snap = toSnapshot(doc, base, null, { n: 0 })
+    }
+    this._staticFrames.set(url, snap)
+    return snap
+  }
+
+  LogItReplayer.prototype._queueStaticFrame = function (el, url) {
+    var snap = this._staticFrame(url)
+    if (snap) this._pendingFrames.push({ el: el, doc: snap })
   }
 
   // ---------------------------------------------------------------- constructed stylesheets
@@ -418,6 +491,16 @@
     img.src = data
   }
 
+  // An MSE video plays its HLS / DASH stream, flattened into one file by the server, when it was archived.
+  LogItReplayer.prototype._setStream = function (el, url) {
+    var src = this._url(url)
+    if (!src || src === url || el.__logitStream === src) return
+    el.__logitStream = src
+    try { el.setAttribute('src', src) } catch (e) { /* ignore */ }
+    var m = this.media.get(el)
+    if (m) this._setMedia(el, m.state, m.offset)
+  }
+
   // Replayed media is always muted: autoplay with sound is blocked without a gesture inside the frame.
   LogItReplayer.prototype._setMedia = function (el, state, offset) {
     this.media.set(el, { state: state, offset: offset })
@@ -496,9 +579,14 @@
       case 'iframe':
         n = this.nodes.get(d.id)
         if (n) {
-          this._pendingFrames.push({ el: n, doc: d.node })
+          if (d.node) this._pendingFrames.push({ el: n, doc: d.node })
+          else if (d.url) this._queueStaticFrame(n, d.url)
           this._flushFrames()
         }
+        break
+      case 'stream':
+        n = this.nodes.get(d.id)
+        if (n) this._setStream(n, d.url)
         break
       case 'adopted':
         n = this.nodes.get(d.id)
